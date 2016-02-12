@@ -16,20 +16,17 @@ struct osd_object {
     // OSDTYPE_SUB/OSDTYPE_SUB2/OSDTYPE_OSD/OSDTYPE_EXTERNAL
     char *text;
 
-    // OSDTYPE_PROGBAR
+    // OSDTYPE_OSD
     struct osd_progbar_state progbar_state;
 
     // OSDTYPE_SUB/OSDTYPE_SUB2
-    struct osd_sub_state sub_state;
+    struct dec_sub *sub;
 
     // OSDTYPE_EXTERNAL
     int external_res_x, external_res_y;
 
     // OSDTYPE_EXTERNAL2
     struct sub_bitmaps *external2;
-
-    // OSDTYPE_NAV_HIGHLIGHT
-    void *highlight_priv;
 
     // caches for OSD conversion (internal to render_object())
     struct osd_conv_cache *cache[OSD_CONV_CACHE_MAX];

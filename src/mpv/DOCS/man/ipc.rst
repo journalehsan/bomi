@@ -79,6 +79,24 @@ mpv will also send events to clients with JSON messages of the following form:
 where ``event_name`` is the name of the event. Additional event-specific fields
 can also be present. See `List of events`_ for a list of all supported events.
 
+Because events can occur at any time, it may be difficult at times to determine
+which response goes with which command. Commands may optionally include a
+``request_id`` which, if provided in the command request, will be copied
+verbatim into the response. mpv does not intrepret the ``request_id`` in any
+way; it is solely for the use of the requester.
+
+For example, this request:
+
+::
+
+    { "command": ["get_property", "time-pos"], "request_id": 100 }
+
+Would generate this response:
+
+::
+
+    { "error": "success", "data": 1.468135, "request_id": 100 }
+
 All commands, replies, and events are separated from each other with a line
 break character (``\n``).
 
@@ -93,7 +111,7 @@ rely on this.
 Commands
 --------
 
-Additionally to  the commands described in `List of Input Commands`_, a few
+In addition to the commands described in `List of Input Commands`_, a few
 extra commands can also be used as part of the protocol:
 
 ``client_name``
@@ -171,7 +189,7 @@ extra commands can also be used as part of the protocol:
 
 ``unobserve_property``
     Undo ``observe_property`` or ``observe_property_string``. This requires the
-    numeric id passed to the observe command as argument.
+    numeric id passed to the observed command as argument.
 
     Example:
 
@@ -210,7 +228,9 @@ extra commands can also be used as part of the protocol:
 
 ``get_version``
     Returns the client API version the C API of the remote mpv instance
-    provides. (Also see ``DOCS/client-api-changes.rst``.)
+    provides.
+
+    See also: ``DOCS/client-api-changes.rst``.
 
 UTF-8
 -----

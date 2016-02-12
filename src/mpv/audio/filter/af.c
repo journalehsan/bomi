@@ -31,27 +31,15 @@
 #include "af.h"
 
 // Static list of filters
-extern const struct af_info af_info_dummy;
 extern const struct af_info af_info_delay;
 extern const struct af_info af_info_channels;
 extern const struct af_info af_info_format;
-extern const struct af_info af_info_force;
 extern const struct af_info af_info_volume;
 extern const struct af_info af_info_equalizer;
 extern const struct af_info af_info_pan;
-extern const struct af_info af_info_surround;
-extern const struct af_info af_info_sub;
-extern const struct af_info af_info_export;
 extern const struct af_info af_info_drc;
-extern const struct af_info af_info_extrastereo;
 extern const struct af_info af_info_lavcac3enc;
 extern const struct af_info af_info_lavrresample;
-extern const struct af_info af_info_sweep;
-extern const struct af_info af_info_hrtf;
-extern const struct af_info af_info_ladspa;
-extern const struct af_info af_info_center;
-extern const struct af_info af_info_sinesuppress;
-extern const struct af_info af_info_karaoke;
 extern const struct af_info af_info_scaletempo;
 extern const struct af_info af_info_bs2b;
 extern const struct af_info af_info_lavfi;
@@ -64,32 +52,14 @@ static const struct af_info *const filter_list[] = {
     &af_info_volume,
     &af_info_equalizer,
     &af_info_pan,
-    &af_info_surround,
-    &af_info_sub,
-    &af_info_export,
     &af_info_drc,
-    &af_info_extrastereo,
     &af_info_lavcac3enc,
     &af_info_lavrresample,
-    &af_info_sweep,
-    &af_info_hrtf,
-#if HAVE_LADSPA
-    &af_info_ladspa,
-#endif
 #if HAVE_RUBBERBAND
     &af_info_rubberband,
 #endif
-    &af_info_center,
-    &af_info_sinesuppress,
-    &af_info_karaoke,
     &af_info_scaletempo,
-#if HAVE_LIBBS2B
-    &af_info_bs2b,
-#endif
-#if HAVE_LIBAVFILTER
     &af_info_lavfi,
-#endif
-    &af_info_dummy,
     NULL
 };
 
@@ -187,26 +157,14 @@ static struct af_instance *af_create(struct af_stream *s, char *name,
         MP_ERR(s, "Couldn't find audio filter '%s'.\n", name);
         return NULL;
     }
-    const struct af_info *info = desc.p;
-    /* Make sure that the filter is not already in the list if it is
-       non-reentrant */
-    if (info->flags & AF_FLAGS_NOT_REENTRANT) {
-        for (struct af_instance *cur = s->first; cur; cur = cur->next) {
-            if (cur->info == info) {
-                MP_ERR(s, "There can only be one "
-                       "instance of the filter '%s' in each stream\n", name);
-                return NULL;
-            }
-        }
-    }
-
     MP_VERBOSE(s, "Adding filter %s \n", name);
 
     struct af_instance *af = talloc_zero(NULL, struct af_instance);
     *af = (struct af_instance) {
-        .info = info,
+        .info = desc.p,
         .data = talloc_zero(af, struct mp_audio),
         .log = mp_log_new(af, s->log, name),
+        .opts = s->opts,
         .replaygain_data = s->replaygain_data,
         .out_pool = mp_audio_pool_create(af),
     };
@@ -352,18 +310,23 @@ static int af_fix_format_conversion(struct af_stream *s,
         return AF_FALSE;
     int dstfmt = in.format;
     char *filter = "lavrresample";
+    if (!af_lavrresample_test_conversion(actual.format, dstfmt))
+        return AF_ERROR;
     if (strcmp(filter, prev->info->name) == 0) {
         if (prev->control(prev, AF_CONTROL_SET_FORMAT, &dstfmt) == AF_OK) {
             *p_af = prev;
             return AF_OK;
         }
+        return AF_ERROR;
     }
     struct af_instance *new = af_prepend(s, af, filter, NULL);
     if (new == NULL)
         return AF_ERROR;
     new->auto_inserted = true;
-    if (AF_OK != (rv = new->control(new, AF_CONTROL_SET_FORMAT, &dstfmt)))
+    if (AF_OK != (rv = new->control(new, AF_CONTROL_SET_FORMAT, &dstfmt))) {
+        af_remove(s, new);
         return rv;
+    }
     *p_af = new;
     return AF_OK;
 }
@@ -488,8 +451,8 @@ static int af_reinit(struct af_stream *s)
             int fmt_in1 = af->prev->data->format;
             int fmt_in2 = in.format;
             if (af_fmt_is_valid(fmt_in1) && af_fmt_is_valid(fmt_in2)) {
-                bool spd1 = AF_FORMAT_IS_IEC61937(fmt_in1);
-                bool spd2 = AF_FORMAT_IS_IEC61937(fmt_in2);
+                bool spd1 = af_fmt_is_spdif(fmt_in1);
+                bool spd2 = af_fmt_is_spdif(fmt_in2);
                 if (spd1 != spd2 && af->next) {
                     MP_WARN(af, "Filter %s apparently cannot be used due to "
                                 "spdif passthrough - removing it.\n",
@@ -497,7 +460,8 @@ static int af_reinit(struct af_stream *s)
                     struct af_instance *aft = af->prev;
                     af_remove(s, af);
                     af = aft->next;
-                    break;
+                    retry++;
+                    continue;
                 }
             }
             goto negotiate_error;
@@ -514,6 +478,8 @@ static int af_reinit(struct af_stream *s)
                    af->info->name, rv);
             goto error;
         }
+        if (af && !af->auto_inserted)
+            retry = 0;
     }
 
     /* Set previously unset fields in s->output to those of the filter chain
@@ -646,7 +612,7 @@ struct af_instance *af_add(struct af_stream *s, char *name, char *label,
         return NULL;
     new->label = talloc_strdup(new, label);
 
-    // Reinitalize the filter list
+    // Reinitialize the filter list
     if (af_reinit(s) != AF_OK) {
         af_remove_by_label(s, label);
         return NULL;
@@ -714,6 +680,29 @@ void af_control_all(struct af_stream *s, int cmd, void *arg)
 {
     for (struct af_instance *af = s->first; af; af = af->next)
         af->control(af, cmd, arg);
+}
+
+int af_control_by_label(struct af_stream *s, int cmd, void *arg, bstr label)
+{
+    char *label_str = bstrdup0(NULL, label);
+    struct af_instance *cur = af_find_by_label(s, label_str);
+    talloc_free(label_str);
+    if (cur) {
+        return cur->control ? cur->control(cur, cmd, arg) : CONTROL_NA;
+    } else {
+        return CONTROL_UNKNOWN;
+    }
+}
+
+int af_send_command(struct af_stream *s, char *label, char *cmd, char *arg)
+{
+    char *args[2] = {cmd, arg};
+    if (strcmp(label, "all") == 0) {
+        af_control_all(s, AF_CONTROL_COMMAND, args);
+        return 0;
+    } else {
+        return af_control_by_label(s, AF_CONTROL_COMMAND, args, bstr0(label));
+    }
 }
 
 // Used by filters to add a filtered frame to the output queue.

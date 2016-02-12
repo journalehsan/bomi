@@ -26,6 +26,21 @@ variety of video file formats, audio and video codecs, and subtitle types.
 
 Releases can be found on the [release list][releases].
 
+## System requirements
+
+- A not too ancient Linux, or Windows Vista or later, or OSX 10.8 or later.
+- A somewhat capable CPU. Hardware decoding might sometimes help if the CPU
+  is too slow to decode video realtime, but must be explicitly enabled with
+  the `--hwdec` option. On Windows, a CPU with SSE4 instruction set is required
+  to get decent hardware decoding performance.
+- A not too crappy GPU. mpv is not intended to be used with bad GPUs. There are
+  many caveats with drivers or system compositors causing tearing, stutter,
+  etc. On Windows, you might want to make sure the graphics drivers are
+  current, especially OpenGL. In some cases, ancient fallback video output
+  methods can help (such as `--vo=xv` on Linux), but this use is not
+  recommended or supported.
+
+
 ## Downloads
 
 
@@ -70,7 +85,7 @@ Essential dependencies (incomplete list):
 - libass (OSD, OSC, text subtitles)
 - Lua (optional, required for the OSC pseudo-GUI and youtube-dl integration)
 - libjpeg (optional, used for screenshots only)
-- Enca (optional, for subtitle charset detection)
+- uchardet (optional, for subtitle charset detection)
 - vdpau and vaapi libraries for hardware decoding on Linux (optional)
 
 Libass dependencies:
@@ -96,12 +111,9 @@ the separately available build wrapper ([mpv-build][mpv-build]) that first compi
 libraries and libass, and then compiles the player statically linked against
 those.
 
-If you are running Mac OSX and using homebrew we provide [homebrew-mpv][homebrew-mpv], an up
-to date formula that compiles mpv with sensible dependencies and defaults for
-OSX.
-
 If you want to build a Windows binary, you either have to use MSYS2 and MinGW,
 or cross-compile from Linux with MinGW. See [Windows compilation][windows_compilation].
+
 
 ## FFmpeg vs. Libav
 
@@ -171,11 +183,9 @@ list of changes is located [here][mplayer-changes].
 Most activity happens on the IRC channel and the github issue tracker. The
 mailing lists are mostly unused.
 
- - **Github issue tracker**: [issue tracker][issue-tracker] (report bugs here)
+ - **GitHub issue tracker**: [issue tracker][issue-tracker] (report bugs here)
  - **User IRC Channel**: `#mpv` on `irc.freenode.net`
  - **Developer IRC Channel**: `#mpv-devel` on `irc.freenode.net`
- - **Users Mailing List**: `mpv-users@googlegroups.com` ([Archive / Subscribe][mpv-users]).
- - **Devel Mailing List**: `mpv-devel@googlegroups.com` ([Archive / Subscribe][mpv-devel])
 
 To contact the `mpv` team in private write to `mpv-team@googlegroups.com`. Use
 only if discretion is required.
@@ -184,14 +194,12 @@ only if discretion is required.
 [mpv-build]: https://github.com/mpv-player/mpv-build
 [homebrew-mpv]: https://github.com/mpv-player/homebrew-mpv
 [issue-tracker]:  https://github.com/mpv-player/mpv/issues
-[mpv-users]: https://groups.google.com/forum/?hl=en#!forum/mpv-users
-[mpv-devel]: https://groups.google.com/forum/?hl=en#!forum/mpv-devel
 [ffmpeg_vs_libav]: https://github.com/mpv-player/mpv/wiki/FFmpeg-versus-Libav
 [release-policy]: https://github.com/mpv-player/mpv/blob/master/DOCS/release-policy.md
 [windows_compilation]: https://github.com/mpv-player/mpv/blob/master/DOCS/compile-windows.md
 [mplayer-changes]: https://github.com/mpv-player/mpv/blob/master/DOCS/mplayer-changes.rst
 
-## License 
+## License
 
 
-[GPLv2](https://github.com/mpv-player/mpv/blob/master/LICENSE)
+Mostly GPLv2 or later. See [details.](https://github.com/mpv-player/mpv/blob/master/Copyright)

@@ -76,12 +76,15 @@ static int find_best_out(vf_instance_t *vf, int in_format)
 static int reconfig(struct vf_instance *vf, struct mp_image_params *in,
                     struct mp_image_params *out)
 {
-    int width = in->w, height = in->h, d_width = in->d_w, d_height = in->d_h;
+    int width = in->w, height = in->h;
+    int d_width, d_height;
+    mp_image_params_get_dsize(in, &d_width, &d_height);
+
     unsigned int best = find_best_out(vf, in->imgfmt);
     int round_w = 0, round_h = 0;
 
     if (!best) {
-        MP_WARN(vf, "SwScale: no supported outfmt found :(\n");
+        MP_WARN(vf, "no supported output format found\n");
         return -1;
     }
 
@@ -102,10 +105,7 @@ static int reconfig(struct vf_instance *vf, struct mp_image_params *in,
     if (vf->priv->w < -3 || vf->priv->h < -3 ||
         (vf->priv->w < -1 && vf->priv->h < -1))
     {
-        // TODO: establish a direct connection to the user's brain
-        // and find out what the heck he thinks MPlayer should do
-        // with this nonsense.
-        MP_ERR(vf, "SwScale: EUSERBROKEN Check your parameters, they make no sense!\n");
+        MP_ERR(vf, "invalid parameters\n");
         return -1;
     }
 
@@ -142,9 +142,7 @@ static int reconfig(struct vf_instance *vf, struct mp_image_params *in,
         }
     }
 
-    MP_DBG(vf, "SwScale: scaling %dx%d %s to %dx%d %s  \n",
-           width, height, vo_format_name(in->imgfmt), vf->priv->w, vf->priv->h,
-           vo_format_name(best));
+    MP_DBG(vf, "scaling %dx%d to %dx%d\n", width, height, vf->priv->w, vf->priv->h);
 
     // Compute new d_width and d_height, preserving aspect
     // while ensuring that both are >= output size in pixels.
@@ -159,8 +157,7 @@ static int reconfig(struct vf_instance *vf, struct mp_image_params *in,
     *out = *in;
     out->w = vf->priv->w;
     out->h = vf->priv->h;
-    out->d_w = d_width;
-    out->d_h = d_height;
+    mp_image_params_set_dsize(out, d_width, d_height);
     out->imgfmt = best;
 
     // Second-guess what libswscale is going to output and what not.
@@ -241,10 +238,6 @@ static int vf_open(vf_instance_t *vf)
     vf->priv->sws->log = vf->log;
     vf->priv->sws->params[0] = vf->priv->param[0];
     vf->priv->sws->params[1] = vf->priv->param[1];
-
-    MP_VERBOSE(vf, "SwScale params: %d x %d (-1=no scaling)\n",
-           vf->priv->cfg_w, vf->priv->cfg_h);
-
     return 1;
 }
 

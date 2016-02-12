@@ -20,7 +20,7 @@
 #include <string.h>
 #include <assert.h>
 
-#include "talloc.h"
+#include "mpv_talloc.h"
 
 #include "config.h"
 #include "ao.h"
@@ -45,7 +45,6 @@ extern const struct ao_driver audio_out_jack;
 extern const struct ao_driver audio_out_openal;
 extern const struct ao_driver audio_out_null;
 extern const struct ao_driver audio_out_alsa;
-extern const struct ao_driver audio_out_dsound;
 extern const struct ao_driver audio_out_wasapi;
 extern const struct ao_driver audio_out_pcm;
 extern const struct ao_driver audio_out_lavc;
@@ -64,9 +63,6 @@ static const struct ao_driver * const audio_out_drivers[] = {
 #endif
 #if HAVE_WASAPI
     &audio_out_wasapi,
-#endif
-#if HAVE_DSOUND
-    &audio_out_dsound,
 #endif
 #if HAVE_OSS_AUDIO
     &audio_out_oss,
@@ -191,14 +187,14 @@ static struct ao *ao_init(bool probing, struct mpv_global *global,
             snprintf(rdevice, sizeof(rdevice), "%s", ao->device ? ao->device : "");
             talloc_free(ao);
             return ao_init(probing, global, input_ctx, encode_lavc_ctx,
-                           samplerate, format, channels, rdevice, redirect, args);
+                           samplerate, format, channels, rdevice, redirect, NULL);
         }
         goto fail;
     }
 
-    ao->sstride = af_fmt2bps(ao->format);
+    ao->sstride = af_fmt_to_bytes(ao->format);
     ao->num_planes = 1;
-    if (AF_FORMAT_IS_PLANAR(ao->format)) {
+    if (af_fmt_is_planar(ao->format)) {
         ao->num_planes = ao->channels.num;
     } else {
         ao->sstride *= ao->channels.num;
@@ -240,6 +236,7 @@ static void split_ao_device(void *tmp, char *opt, char **out_ao, char **out_dev)
 }
 
 struct ao *ao_init_best(struct mpv_global *global,
+                        bool ao_null_fallback,
                         struct input_ctx *input_ctx,
                         struct encode_lavc_context *encode_lavc_ctx,
                         int samplerate, int format, struct mp_chmap channels)
@@ -248,58 +245,67 @@ struct ao *ao_init_best(struct mpv_global *global,
     void *tmp = talloc_new(NULL);
     struct mp_log *log = mp_log_new(tmp, global->log, "ao");
     struct ao *ao = NULL;
-    struct m_obj_settings *ao_list = opts->audio_driver_list;
+    struct m_obj_settings *ao_list = NULL;
+    int ao_num = 0;
+
+    for (int n = 0; opts->audio_driver_list && opts->audio_driver_list[n].name; n++)
+        MP_TARRAY_APPEND(tmp, ao_list, ao_num, opts->audio_driver_list[n]);
 
     bool forced_dev = false;
     char *pref_ao, *pref_dev;
     split_ao_device(tmp, opts->audio_device, &pref_ao, &pref_dev);
-    if (!(ao_list && ao_list[0].name) && pref_ao) {
+    if (!ao_num && pref_ao) {
         // Reuse the autoselection code
-        ao_list = talloc_zero_array(tmp, struct m_obj_settings, 2);
-        ao_list[0].name = pref_ao;
+        MP_TARRAY_APPEND(tmp, ao_list, ao_num,
+            (struct m_obj_settings){.name = pref_ao});
         forced_dev = true;
     }
 
-    if (ao_list && ao_list[0].name) {
-        for (int n = 0; ao_list[n].name; n++) {
-            if (strlen(ao_list[n].name) == 0)
-                goto autoprobe;
-            mp_verbose(log, "Trying preferred audio driver '%s'\n",
-                       ao_list[n].name);
-            char *dev = NULL;
-            if (pref_ao && strcmp(ao_list[n].name, pref_ao) == 0)
-                dev = pref_dev;
-            if (dev)
-                mp_verbose(log, "Using preferred device '%s'\n", dev);
-            ao = ao_init(false, global, input_ctx, encode_lavc_ctx,
-                         samplerate, format, channels, dev,
-                         ao_list[n].name, ao_list[n].attribs);
-            if (ao)
-                goto done;
-            mp_err(log, "Failed to initialize audio driver '%s'\n",
-                   ao_list[n].name);
-            if (forced_dev) {
-                mp_err(log, "This audio driver/device was forced with the "
-                            "--audio-device option.\n"
-                            "Try unsetting it.\n");
-            }
+    bool autoprobe = ao_num == 0;
+
+    // Something like "--ao=a,b," means do autoprobing after a and b fail.
+    if (ao_num && strlen(ao_list[ao_num - 1].name) == 0) {
+        ao_num -= 1;
+        autoprobe = true;
+    }
+
+    if (autoprobe) {
+        for (int n = 0; audio_out_drivers[n]; n++) {
+            const struct ao_driver *driver = audio_out_drivers[n];
+            if (driver == &audio_out_null)
+                break;
+            MP_TARRAY_APPEND(tmp, ao_list, ao_num,
+                (struct m_obj_settings){.name = (char *)driver->name});
         }
-        goto done;
     }
 
-autoprobe: ;
-    // now try the rest...
-    for (int i = 0; audio_out_drivers[i]; i++) {
-        const struct ao_driver *driver = audio_out_drivers[i];
-        if (driver == &audio_out_null)
-            break;
-        ao = ao_init(true, global, input_ctx, encode_lavc_ctx, samplerate,
-                     format, channels, NULL, (char *)driver->name, NULL);
+    if (ao_null_fallback) {
+        MP_TARRAY_APPEND(tmp, ao_list, ao_num,
+            (struct m_obj_settings){.name = "null"});
+    }
+
+    for (int n = 0; n < ao_num; n++) {
+        struct m_obj_settings *entry = &ao_list[n];
+        bool probing = n + 1 != ao_num;
+        mp_verbose(log, "Trying audio driver '%s'\n", entry->name);
+        char *dev = NULL;
+        if (pref_ao && pref_dev && strcmp(entry->name, pref_ao) == 0) {
+            dev = pref_dev;
+            mp_verbose(log, "Using preferred device '%s'\n", dev);
+        }
+        ao = ao_init(probing, global, input_ctx, encode_lavc_ctx,
+                     samplerate, format, channels, dev,
+                     entry->name, entry->attribs);
         if (ao)
-            goto done;
+            break;
+        if (!probing)
+            mp_err(log, "Failed to initialize audio driver '%s'\n", entry->name);
+        if (dev && forced_dev) {
+            mp_err(log, "This audio driver/device was forced with the "
+                        "--audio-device option.\nTry unsetting it.\n");
+        }
     }
 
-done:
     talloc_free(tmp);
     return ao;
 }
@@ -411,22 +417,11 @@ void ao_hotplug_event(struct ao *ao)
 bool ao_chmap_sel_adjust(struct ao *ao, const struct mp_chmap_sel *s,
                          struct mp_chmap *map)
 {
-    if (mp_msg_test(ao->log, MSGL_DEBUG)) {
-        for (int i = 0; i < s->num_chmaps; i++) {
-            struct mp_chmap c = s->chmaps[i];
-            struct mp_chmap cr = c;
-            mp_chmap_reorder_norm(&cr);
-            MP_DBG(ao, "chmap_sel #%d: %s (%s)\n", i, mp_chmap_to_str(&c),
-                   mp_chmap_to_str(&cr));
-        }
-    }
+    MP_VERBOSE(ao, "Channel layouts:\n");
+    mp_chmal_sel_log(s, ao->log, MSGL_V);
     bool r = mp_chmap_sel_adjust(s, map);
-    if (r) {
-        struct mp_chmap mapr = *map;
-        mp_chmap_reorder_norm(&mapr);
-        MP_DBG(ao, "result: %s (%s)\n", mp_chmap_to_str(map),
-               mp_chmap_to_str(&mapr));
-    }
+    if (r)
+        MP_VERBOSE(ao, "result: %s\n", mp_chmap_to_str(map));
     return r;
 }
 
@@ -494,8 +489,12 @@ static void get_devices(struct ao *ao, struct ao_device_list *list)
     if (ao->driver->list_devs)
         ao->driver->list_devs(ao, list);
     // Add at least a default entry
-    if (list->num_devices == num)
-        ao_device_list_add(list, ao, &(struct ao_device_desc){"", "Default"});
+    if (list->num_devices == num) {
+        char name[80] = "Default";
+        if (num > 1)
+            mp_snprintf_cat(name, sizeof(name), " (%s)", ao->driver->name);
+        ao_device_list_add(list, ao, &(struct ao_device_desc){"", name});
+    }
 }
 
 bool ao_hotplug_check_update(struct ao_hotplug *hp)

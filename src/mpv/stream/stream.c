@@ -29,7 +29,7 @@
 #include "osdep/atomics.h"
 #include "osdep/io.h"
 
-#include "talloc.h"
+#include "mpv_talloc.h"
 
 #include "config.h"
 
@@ -57,7 +57,6 @@
 extern const stream_info_t stream_info_cdda;
 extern const stream_info_t stream_info_dvb;
 extern const stream_info_t stream_info_tv;
-extern const stream_info_t stream_info_pvr;
 extern const stream_info_t stream_info_smb;
 extern const stream_info_t stream_info_null;
 extern const stream_info_t stream_info_memory;
@@ -75,6 +74,7 @@ extern const stream_info_t stream_info_bluray;
 extern const stream_info_t stream_info_bdnav;
 extern const stream_info_t stream_info_rar;
 extern const stream_info_t stream_info_edl;
+extern const stream_info_t stream_info_libarchive;
 
 static const stream_info_t *const stream_list[] = {
 #if HAVE_CDDA
@@ -88,9 +88,6 @@ static const stream_info_t *const stream_list[] = {
 #endif
 #if HAVE_TV
     &stream_info_tv,
-#endif
-#if HAVE_PVR
-    &stream_info_pvr,
 #endif
 #if HAVE_LIBSMBCLIENT
     &stream_info_smb,
@@ -107,6 +104,9 @@ static const stream_info_t *const stream_list[] = {
     &stream_info_bdmv_dir,
     &stream_info_bluray,
     &stream_info_bdnav,
+#endif
+#if HAVE_LIBARCHIVE
+    &stream_info_libarchive,
 #endif
 
     &stream_info_memory,
@@ -284,6 +284,8 @@ static int open_internal(const stream_info_t *sinfo, const char *url, int flags,
     s->is_network = sinfo->is_network;
     s->mode = flags & (STREAM_READ | STREAM_WRITE);
 
+    MP_VERBOSE(s, "Opening %s\n", url);
+
     if ((s->mode & STREAM_WRITE) && !sinfo->can_write) {
         MP_VERBOSE(s, "No write access implemented.\n");
         talloc_free(s);
@@ -324,10 +326,10 @@ static int open_internal(const stream_info_t *sinfo, const char *url, int flags,
 
     s->uncached_type = s->type;
 
-    MP_VERBOSE(s, "Opened: %s\n", url);
-
     if (s->mime_type)
         MP_VERBOSE(s, "Mime-type: '%s'\n", s->mime_type);
+
+    MP_VERBOSE(s, "Stream opened successfully.\n");
 
     *ret = s;
     return STREAM_OK;
@@ -464,8 +466,7 @@ static int stream_read_unbuffered(stream_t *s, void *buf, int len)
         // just in case this is an error e.g. due to network
         // timeout reset and retry
         // do not retry if this looks like proper eof
-        int64_t size = -1;
-        stream_control(s, STREAM_CTRL_GET_SIZE, &size);
+        int64_t size = stream_get_size(s);
         if (!s->eof && s->pos != size && stream_reconnect(s)) {
             s->eof = 1; // make sure EOF is set to ensure no endless recursion
             return stream_read_unbuffered(s, buf, orig_len);
@@ -499,7 +500,7 @@ int stream_fill_buffer(stream_t *s)
 }
 
 // Read between 1..buf_size bytes of data, return how much data has been read.
-// Return 0 on EOF, error, of if buf_size was 0.
+// Return 0 on EOF, error, or if buf_size was 0.
 int stream_read_partial(stream_t *s, char *buf, int buf_size)
 {
     assert(s->buf_pos <= s->buf_len);
@@ -696,6 +697,15 @@ bool stream_skip(stream_t *s, int64_t len)
 int stream_control(stream_t *s, int cmd, void *arg)
 {
     return s->control ? s->control(s, cmd, arg) : STREAM_UNSUPPORTED;
+}
+
+// Return the current size of the stream, or a negative value if unknown.
+int64_t stream_get_size(stream_t *s)
+{
+    int64_t size = -1;
+    if (stream_control(s, STREAM_CTRL_GET_SIZE, &size) != STREAM_OK)
+        size = -1;
+    return size;
 }
 
 void free_stream(stream_t *s)
@@ -904,8 +914,7 @@ struct bstr stream_read_complete(struct stream *s, void *talloc_ctx,
     int total_read = 0;
     int padding = 1;
     char *buf = NULL;
-    int64_t size = 0;
-    stream_control(s, STREAM_CTRL_GET_SIZE, &size);
+    int64_t size = stream_get_size(s) - stream_tell(s);
     if (size > max_size)
         return (struct bstr){NULL, 0};
     if (size > 0)

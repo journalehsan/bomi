@@ -22,7 +22,7 @@
 #include <assert.h>
 
 #include "config.h"
-#include "talloc.h"
+#include "mpv_talloc.h"
 
 #include "common/msg.h"
 #include "options/options.h"
@@ -73,6 +73,14 @@ void mp_process_input(struct MPContext *mpctx)
     }
 }
 
+double get_relative_time(struct MPContext *mpctx)
+{
+    int64_t new_time = mp_time_us();
+    int64_t delta = new_time - mpctx->last_time;
+    mpctx->last_time = new_time;
+    return delta * 0.000001;
+}
+
 void pause_player(struct MPContext *mpctx)
 {
     mpctx->opts->pause = 1;
@@ -89,7 +97,7 @@ void pause_player(struct MPContext *mpctx)
     mpctx->osd_force_update = true;
     mpctx->paused_for_cache = false;
 
-    if (mpctx->ao && mpctx->d_audio)
+    if (mpctx->ao && mpctx->ao_chain)
         ao_pause(mpctx->ao);
     if (mpctx->video_out)
         vo_set_paused(mpctx->video_out, true);
@@ -114,7 +122,7 @@ void unpause_player(struct MPContext *mpctx)
     mpctx->osd_function = 0;
     mpctx->osd_force_update = true;
 
-    if (mpctx->ao && mpctx->d_audio)
+    if (mpctx->ao && mpctx->ao_chain)
         ao_resume(mpctx->ao);
     if (mpctx->video_out)
         vo_set_paused(mpctx->video_out, false);
@@ -127,15 +135,14 @@ end:
 
 void add_step_frame(struct MPContext *mpctx, int dir)
 {
-    if (!mpctx->d_video)
+    if (!mpctx->vo_chain)
         return;
     if (dir > 0) {
         mpctx->step_frames += 1;
         unpause_player(mpctx);
     } else if (dir < 0) {
-        if (!mpctx->backstep_active && !mpctx->hrseek_active) {
-            mpctx->backstep_active = true;
-            mpctx->backstep_start_seek_ts = mpctx->vo_pts_history_seek_ts;
+        if (!mpctx->hrseek_backstep || !mpctx->hrseek_active) {
+            queue_seek(mpctx, MPSEEK_BACKSTEP, 0, MPSEEK_VERY_EXACT, true);
             pause_player(mpctx);
         }
     }
@@ -144,6 +151,16 @@ void add_step_frame(struct MPContext *mpctx, int dir)
 // Clear some playback-related fields on file loading or after seeks.
 void reset_playback_state(struct MPContext *mpctx)
 {
+    if (mpctx->lavfi)
+        lavfi_seek_reset(mpctx->lavfi);
+
+    for (int n = 0; n < mpctx->num_tracks; n++) {
+        if (mpctx->tracks[n]->d_video)
+            video_reset(mpctx->tracks[n]->d_video);
+        if (mpctx->tracks[n]->d_audio)
+            audio_reset_decoding(mpctx->tracks[n]->d_audio);
+    }
+
     reset_video_state(mpctx);
     reset_audio_state(mpctx);
     reset_subtitle_state(mpctx);
@@ -151,6 +168,7 @@ void reset_playback_state(struct MPContext *mpctx)
     mpctx->hrseek_active = false;
     mpctx->hrseek_framedrop = false;
     mpctx->hrseek_lastframe = false;
+    mpctx->hrseek_backstep = false;
     mpctx->playback_pts = MP_NOPTS_VALUE;
     mpctx->last_seek_pts = MP_NOPTS_VALUE;
     mpctx->cache_wait_time = 0;
@@ -167,7 +185,6 @@ static int mp_seek(MPContext *mpctx, struct seek_params seek,
                    bool timeline_fallthrough)
 {
     struct MPOpts *opts = mpctx->opts;
-    uint64_t prev_seek_ts = mpctx->vo_pts_history_seek_ts;
     int prev_step = mpctx->step_frames;
 
     if (!mpctx->demuxer)
@@ -190,38 +207,57 @@ static int mp_seek(MPContext *mpctx, struct seek_params seek,
     if (hr_seek_very_exact)
         hr_seek_offset = MPMAX(hr_seek_offset, 0.5); // arbitrary
 
+    double target_time = MP_NOPTS_VALUE;
+    int direction = 0;
+    bool backstep = false;
+
+    switch (seek.type) {
+    case MPSEEK_ABSOLUTE:
+        target_time = seek.amount;
+        break;
+    case MPSEEK_BACKSTEP:
+        seek.type = MPSEEK_ABSOLUTE;
+        seek.amount = get_current_time(mpctx);
+        if (seek.amount == MP_NOPTS_VALUE)
+            seek.amount = 0;
+        target_time = seek.amount;
+        backstep = true;
+        break;
+    case MPSEEK_RELATIVE:
+        direction = seek.amount > 0 ? 1 : -1;
+        double cur = get_current_time(mpctx);
+        target_time = seek.amount + (cur == MP_NOPTS_VALUE ? 0 : cur);
+        break;
+    case MPSEEK_FACTOR: ;
+        double len = get_time_length(mpctx);
+        if (len >= 0)
+            target_time = seek.amount * len;
+        break;
+    }
+
     bool hr_seek = opts->correct_pts && seek.exact != MPSEEK_KEYFRAME;
     hr_seek &= (opts->hr_seek == 0 && seek.type == MPSEEK_ABSOLUTE) ||
                opts->hr_seek > 0 || seek.exact >= MPSEEK_EXACT;
     if (seek.type == MPSEEK_FACTOR || seek.amount < 0 ||
         (seek.type == MPSEEK_ABSOLUTE && seek.amount < mpctx->last_chapter_pts))
         mpctx->last_chapter_seek = -2;
-    if (seek.type == MPSEEK_FACTOR && !mpctx->demuxer->ts_resets_possible) {
-        double len = get_time_length(mpctx);
-        if (len >= 0) {
-            seek.amount = seek.amount * len + get_start_time(mpctx);
-            seek.type = MPSEEK_ABSOLUTE;
-        }
-    }
-    int direction = 0;
-    if (seek.type == MPSEEK_RELATIVE && (!mpctx->demuxer->rel_seeks || hr_seek)) {
+
+    // Prefer doing absolute seeks, unless not possible.
+    if ((seek.type == MPSEEK_FACTOR && !mpctx->demuxer->ts_resets_possible &&
+         target_time != MP_NOPTS_VALUE) ||
+        (seek.type == MPSEEK_RELATIVE && (!mpctx->demuxer->rel_seeks || hr_seek)))
+    {
         seek.type = MPSEEK_ABSOLUTE;
-        direction = seek.amount > 0 ? 1 : -1;
-        seek.amount += get_current_time(mpctx);
+        seek.amount = target_time;
     }
+
     hr_seek &= seek.type == MPSEEK_ABSOLUTE; // otherwise, no target PTS known
 
     double demuxer_amount = seek.amount;
-    if (mpctx->timeline) {
-        bool need_reset = false;
-        demuxer_amount = timeline_set_from_time(mpctx, seek.amount,
-                                                &need_reset);
-        if (need_reset) {
-            reinit_video_chain(mpctx);
-            reinit_audio_chain(mpctx);
-            reinit_subs(mpctx, 0);
-            reinit_subs(mpctx, 1);
-        }
+    if (timeline_switch_to_time(mpctx, seek.amount)) {
+        reinit_video_chain(mpctx);
+        reinit_audio_chain(mpctx);
+        reinit_sub_all(mpctx);
     }
 
     int demuxer_style = 0;
@@ -249,10 +285,9 @@ static int mp_seek(MPContext *mpctx, struct seek_params seek,
     for (int t = 0; t < mpctx->num_tracks; t++) {
         struct track *track = mpctx->tracks[t];
         if (track->selected && track->is_external && track->demuxer) {
-            double main_new_pos = seek.amount;
+            double main_new_pos = demuxer_amount;
             if (seek.type != MPSEEK_ABSOLUTE)
-                main_new_pos = get_main_demux_pts(mpctx);
-            main_new_pos -= get_track_video_offset(mpctx, track);
+                main_new_pos = target_time;
             demux_seek(track->demuxer, main_new_pos, SEEK_ABSOLUTE | SEEK_BACKWARD);
         }
     }
@@ -262,19 +297,12 @@ static int mp_seek(MPContext *mpctx, struct seek_params seek,
 
     reset_playback_state(mpctx);
 
-    if (timeline_fallthrough) {
-        // Important if video reinit happens.
-        mpctx->vo_pts_history_seek_ts = prev_seek_ts;
+    if (timeline_fallthrough)
         mpctx->step_frames = prev_step;
-    } else {
-        mpctx->vo_pts_history_seek_ts++;
-        mpctx->backstep_active = false;
-    }
 
     /* Use the target time as "current position" for further relative
      * seeks etc until a new video frame has been decoded */
-    if (seek.type == MPSEEK_ABSOLUTE)
-        mpctx->last_seek_pts = seek.amount;
+    mpctx->last_seek_pts = target_time;
 
     // The hr_seek==false case is for skipping frames with PTS before the
     // current timeline chapter start. It's not really known where the demuxer
@@ -284,9 +312,14 @@ static int mp_seek(MPContext *mpctx, struct seek_params seek,
     // seeking past the chapter is handled elsewhere.
     if (hr_seek || mpctx->timeline) {
         mpctx->hrseek_active = true;
-        mpctx->hrseek_framedrop = !hr_seek_very_exact;
+        mpctx->hrseek_framedrop = !hr_seek_very_exact && opts->hr_seek_framedrop;
+        mpctx->hrseek_backstep = backstep;
         mpctx->hrseek_pts = hr_seek ? seek.amount
                                  : mpctx->timeline[mpctx->timeline_part].start;
+
+        MP_VERBOSE(mpctx, "hr-seek, skipping to %f%s%s\n", mpctx->hrseek_pts,
+                   mpctx->hrseek_framedrop ? "" : " (no framedrop)",
+                   mpctx->hrseek_backstep ? " (backstep)" : "");
     }
 
     mpctx->start_timestamp = mp_time_sec();
@@ -322,6 +355,7 @@ void queue_seek(struct MPContext *mpctx, enum seek_type type, double amount,
         return;
     case MPSEEK_ABSOLUTE:
     case MPSEEK_FACTOR:
+    case MPSEEK_BACKSTEP:
         *seek = (struct seek_params) {
             .type = type,
             .amount = amount,
@@ -373,27 +407,28 @@ double get_time_length(struct MPContext *mpctx)
 double get_current_time(struct MPContext *mpctx)
 {
     struct demuxer *demuxer = mpctx->demuxer;
-    if (!demuxer)
-        return 0;
-    if (mpctx->playback_pts != MP_NOPTS_VALUE)
-        return mpctx->playback_pts;
-    if (mpctx->last_seek_pts != MP_NOPTS_VALUE)
-        return mpctx->last_seek_pts;
-    return 0;
+    if (demuxer) {
+        if (mpctx->playback_pts != MP_NOPTS_VALUE)
+            return mpctx->playback_pts;
+        if (mpctx->last_seek_pts != MP_NOPTS_VALUE)
+            return mpctx->last_seek_pts;
+    }
+    return MP_NOPTS_VALUE;
 }
 
 double get_playback_time(struct MPContext *mpctx)
 {
     double cur = get_current_time(mpctx);
-    double start = get_start_time(mpctx);
+    if (cur == MP_NOPTS_VALUE)
+        return cur;
     // During seeking, the time corresponds to the last seek time - apply some
     // cosmetics to it.
     if (mpctx->playback_pts == MP_NOPTS_VALUE) {
         double length = get_time_length(mpctx);
         if (length >= 0)
-            cur = MPCLAMP(cur, start, start + length);
+            cur = MPCLAMP(cur, 0, length);
     }
-    return cur >= start ? cur - start : cur;
+    return cur;
 }
 
 // Return playback position in 0.0-1.0 ratio, or -1 if unknown.
@@ -403,15 +438,15 @@ double get_current_pos_ratio(struct MPContext *mpctx, bool use_range)
     if (!demuxer)
         return -1;
     double ans = -1;
-    double start = get_start_time(mpctx);
+    double start = 0;
     double len = get_time_length(mpctx);
     if (use_range) {
         double startpos = rel_time_to_abs(mpctx, mpctx->opts->play_start);
         double endpos = get_play_end_pts(mpctx);
-        if (endpos == MP_NOPTS_VALUE || endpos > start + MPMAX(0, len))
-            endpos = start + MPMAX(0, len);
-        if (startpos == MP_NOPTS_VALUE || startpos < start)
-            startpos = start;
+        if (endpos == MP_NOPTS_VALUE || endpos > MPMAX(0, len))
+            endpos = MPMAX(0, len);
+        if (startpos == MP_NOPTS_VALUE || startpos < 0)
+            startpos = 0;
         if (endpos < startpos)
             endpos = startpos;
         start = startpos;
@@ -471,7 +506,6 @@ char *chapter_display_name(struct MPContext *mpctx, int chapter)
             dname = talloc_asprintf(NULL, "(%d) of %d", chapter + 1,
                                     chapter_count);
     }
-    talloc_free(name);
     return dname;
 }
 
@@ -480,14 +514,14 @@ char *chapter_name(struct MPContext *mpctx, int chapter)
 {
     if (chapter < 0 || chapter >= mpctx->num_chapters)
         return NULL;
-    return talloc_strdup(NULL, mpctx->chapters[chapter].name);
+    return mp_tags_get_str(mpctx->chapters[chapter].metadata, "title");
 }
 
-// returns the start of the chapter in seconds (-1 if unavailable)
+// returns the start of the chapter in seconds (NOPTS if unavailable)
 double chapter_start_time(struct MPContext *mpctx, int chapter)
 {
     if (chapter == -1)
-        return get_start_time(mpctx);
+        return 0;
     if (chapter >= 0 && chapter < mpctx->num_chapters)
         return mpctx->chapters[chapter].pts;
     return MP_NOPTS_VALUE;
@@ -496,27 +530,6 @@ double chapter_start_time(struct MPContext *mpctx, int chapter)
 int get_chapter_count(struct MPContext *mpctx)
 {
     return mpctx->num_chapters;
-}
-
-// Seek to a given chapter. Queues the seek.
-bool mp_seek_chapter(struct MPContext *mpctx, int chapter)
-{
-    int num = get_chapter_count(mpctx);
-    if (num == 0)
-        return false;
-    if (chapter < -1 || chapter >= num)
-        return false;
-
-    mpctx->last_chapter_seek = -2;
-
-    double pts = chapter_start_time(mpctx, chapter);
-    if (pts == MP_NOPTS_VALUE)
-        return false;
-
-    queue_seek(mpctx, MPSEEK_ABSOLUTE, pts, MPSEEK_DEFAULT, true);
-    mpctx->last_chapter_seek = chapter;
-    mpctx->last_chapter_pts = pts;
-    return true;
 }
 
 static void handle_osd_redraw(struct MPContext *mpctx)
@@ -530,7 +543,7 @@ static void handle_osd_redraw(struct MPContext *mpctx)
             return;
     }
     // Don't redraw immediately during a seek (makes it significantly slower).
-    if (mpctx->d_video && mp_time_sec() - mpctx->start_timestamp < 0.1) {
+    if (mpctx->vo_chain && mp_time_sec() - mpctx->start_timestamp < 0.1) {
         mpctx->sleeptime = MPMIN(mpctx->sleeptime, 0.1);
         return;
     }
@@ -679,110 +692,6 @@ static void handle_vo_events(struct MPContext *mpctx)
         mp_notify(mpctx, MP_EVENT_WIN_STATE, NULL);
 }
 
-void add_frame_pts(struct MPContext *mpctx, double pts)
-{
-    if (pts == MP_NOPTS_VALUE || mpctx->hrseek_framedrop) {
-        mpctx->vo_pts_history_seek_ts++; // mark discontinuity
-        return;
-    }
-    if (mpctx->vo_pts_history_pts[0] == pts) // may be called multiple times
-        return;
-    for (int n = MAX_NUM_VO_PTS - 1; n >= 1; n--) {
-        mpctx->vo_pts_history_seek[n] = mpctx->vo_pts_history_seek[n - 1];
-        mpctx->vo_pts_history_pts[n] = mpctx->vo_pts_history_pts[n - 1];
-    }
-    mpctx->vo_pts_history_seek[0] = mpctx->vo_pts_history_seek_ts;
-    mpctx->vo_pts_history_pts[0] = pts;
-}
-
-// Return the last (at most num) frame duration in fd[]. Return the number of
-// entries written to fd[] (range [0, num]). fd[0] is the most recent frame.
-int get_past_frame_durations(struct MPContext *mpctx, double *fd, int num)
-{
-    double next_pts = mpctx->vo_pts_history_pts[0];
-    if (mpctx->vo_pts_history_seek[0] != mpctx->vo_pts_history_seek_ts ||
-        next_pts == MP_NOPTS_VALUE)
-        return 0;
-    int num_ret = 0;
-    for (int n = 1; n < MAX_NUM_VO_PTS && num_ret < num; n++) {
-        double frame_pts = mpctx->vo_pts_history_pts[n];
-        // Discontinuity -> refuse to return a value.
-        if (mpctx->vo_pts_history_seek[n] != mpctx->vo_pts_history_seek_ts ||
-            next_pts <= frame_pts || frame_pts == MP_NOPTS_VALUE)
-            break;
-        fd[num_ret++] = next_pts - frame_pts;
-        next_pts = frame_pts;
-    }
-    return num_ret;
-}
-
-static double find_previous_pts(struct MPContext *mpctx, double pts)
-{
-    for (int n = 0; n < MAX_NUM_VO_PTS - 1; n++) {
-        if (pts == mpctx->vo_pts_history_pts[n] &&
-            mpctx->vo_pts_history_seek[n] != 0 &&
-            mpctx->vo_pts_history_seek[n] == mpctx->vo_pts_history_seek[n + 1])
-        {
-            return mpctx->vo_pts_history_pts[n + 1];
-        }
-    }
-    return MP_NOPTS_VALUE;
-}
-
-static double get_last_frame_pts(struct MPContext *mpctx)
-{
-    if (mpctx->vo_pts_history_seek[0] == mpctx->vo_pts_history_seek_ts)
-        return mpctx->vo_pts_history_pts[0];
-    return MP_NOPTS_VALUE;
-}
-
-static void handle_backstep(struct MPContext *mpctx)
-{
-    if (!mpctx->backstep_active)
-        return;
-
-    double current_pts = mpctx->last_vo_pts;
-    mpctx->backstep_active = false;
-    if (mpctx->d_video && current_pts != MP_NOPTS_VALUE) {
-        double seek_pts = find_previous_pts(mpctx, current_pts);
-        if (seek_pts != MP_NOPTS_VALUE) {
-            queue_seek(mpctx, MPSEEK_ABSOLUTE, seek_pts, MPSEEK_VERY_EXACT, true);
-        } else {
-            double last = get_last_frame_pts(mpctx);
-            if (last != MP_NOPTS_VALUE && last >= current_pts &&
-                mpctx->backstep_start_seek_ts != mpctx->vo_pts_history_seek_ts)
-            {
-                MP_ERR(mpctx, "Backstep failed.\n");
-                queue_seek(mpctx, MPSEEK_ABSOLUTE, current_pts,
-                           MPSEEK_VERY_EXACT, true);
-            } else if (!mpctx->hrseek_active) {
-                MP_VERBOSE(mpctx, "Start backstep indexing.\n");
-                // Force it to index the video up until current_pts.
-                // The whole point is getting frames _before_ that PTS,
-                // so apply an arbitrary offset. (In theory the offset
-                // has to be large enough to reach the previous frame.)
-                mp_seek(mpctx, (struct seek_params){
-                               .type = MPSEEK_ABSOLUTE,
-                               .amount = current_pts - 1.0,
-                               }, false);
-                // Don't leave hr-seek mode. If all goes right, hr-seek
-                // mode is cancelled as soon as the frame before
-                // current_pts is found during hr-seeking.
-                // Note that current_pts should be part of the index,
-                // otherwise we can't find the previous frame, so set the
-                // seek target an arbitrary amount of time after it.
-                if (mpctx->hrseek_active) {
-                    mpctx->hrseek_pts = current_pts + 10.0;
-                    mpctx->hrseek_framedrop = false;
-                    mpctx->backstep_active = true;
-                }
-            } else {
-                mpctx->backstep_active = true;
-            }
-        }
-    }
-}
-
 static void handle_sstep(struct MPContext *mpctx)
 {
     struct MPOpts *opts = mpctx->opts;
@@ -795,7 +704,7 @@ static void handle_sstep(struct MPContext *mpctx)
     }
 
     if (mpctx->video_status >= STATUS_EOF) {
-        if (mpctx->max_frames >= 0)
+        if (mpctx->max_frames >= 0 && !mpctx->stop_play)
             mpctx->stop_play = AT_END_OF_FILE; // force EOF even if audio left
         if (mpctx->step_frames > 0 && !mpctx->paused)
             pause_player(mpctx);
@@ -808,8 +717,7 @@ static void handle_loop_file(struct MPContext *mpctx)
     if (opts->loop_file && mpctx->stop_play == AT_END_OF_FILE) {
         mpctx->stop_play = KEEP_PLAYING;
         set_osd_function(mpctx, OSD_FFW);
-        queue_seek(mpctx, MPSEEK_ABSOLUTE, get_start_time(mpctx),
-                   MPSEEK_DEFAULT, true);
+        queue_seek(mpctx, MPSEEK_ABSOLUTE, 0, MPSEEK_DEFAULT, true);
         if (opts->loop_file > 0)
             opts->loop_file--;
     }
@@ -817,7 +725,7 @@ static void handle_loop_file(struct MPContext *mpctx)
 
 void seek_to_last_frame(struct MPContext *mpctx)
 {
-    if (!mpctx->d_video)
+    if (!mpctx->vo_chain)
         return;
     if (mpctx->hrseek_lastframe) // exit if we already tried this
         return;
@@ -847,7 +755,7 @@ static void handle_keep_open(struct MPContext *mpctx)
         opts->loop_times == 1)
     {
         mpctx->stop_play = KEEP_PLAYING;
-        if (mpctx->d_video) {
+        if (mpctx->vo_chain) {
             if (!vo_has_frame(mpctx->video_out)) // EOF not reached normally
                 seek_to_last_frame(mpctx);
             mpctx->playback_pts = mpctx->last_vo_pts;
@@ -866,22 +774,45 @@ static void handle_chapter_change(struct MPContext *mpctx)
     }
 }
 
-// Execute a forceful refresh of the VO window, if it hasn't had a valid frame
-// for a while. The problem is that a VO with no valid frame (vo->hasframe==0)
-// doesn't redraw video and doesn't OSD interaction. So screw it, hard.
-// It also closes the VO if force_window or video display is not active.
-void handle_force_window(struct MPContext *mpctx, bool reconfig)
+// Execute a forceful refresh of the VO window. This clears the window from
+// the previous video. It also creates/destroys the VO on demand.
+// It tries to make the change only in situations where the window is
+// definitely needed or not needed, or if the force parameter is set (the
+// latter also decides whether to clear an existing window, because there's
+// no way to know if this has already been done or not).
+int handle_force_window(struct MPContext *mpctx, bool force)
 {
     // Don't interfere with real video playback
-    if (mpctx->d_video)
-        return;
+    if (mpctx->vo_chain)
+        return 0;
 
-    if (!mpctx->opts->force_vo && mpctx->video_out)
-        uninit_video_out(mpctx);
+    // True if we're either in idle mode, or loading of the file has finished.
+    // It's also set via force in some stages during file loading.
+    bool act = !mpctx->playing || mpctx->playback_initialized || force;
 
-    if (mpctx->video_out && (!mpctx->video_out->config_ok || reconfig)) {
+    if (!mpctx->opts->force_vo) {
+        if (act)
+            uninit_video_out(mpctx);
+        return 0;
+    }
+
+    if (mpctx->opts->force_vo != 2 && !act)
+        return 0;
+
+    if (!mpctx->video_out) {
+        struct vo_extra ex = {
+            .input_ctx = mpctx->input,
+            .osd = mpctx->osd,
+            .encode_lavc_ctx = mpctx->encode_lavc_ctx,
+        };
+        mpctx->video_out = init_best_video_out(mpctx->global, &ex);
+        if (!mpctx->video_out)
+            goto err;
+        mpctx->mouse_cursor_visible = true;
+    }
+
+    if (!mpctx->video_out->config_ok || force) {
         struct vo *vo = mpctx->video_out;
-        MP_INFO(mpctx, "Creating non-video VO window.\n");
         // Pick whatever works
         int config_format = 0;
         uint8_t fmts[IMGFMT_END - IMGFMT_START] = {0};
@@ -897,25 +828,30 @@ void handle_force_window(struct MPContext *mpctx, bool reconfig)
         struct mp_image_params p = {
             .imgfmt = config_format,
             .w = w,   .h = h,
-            .d_w = w, .d_h = h,
+            .p_w = 1, .p_h = 1,
         };
-        if (vo_reconfig(vo, &p, 0) < 0) {
-            mpctx->opts->force_vo = 0;
-            uninit_video_out(mpctx);
-            return;
-        }
+        if (vo_reconfig(vo, &p) < 0)
+            goto err;
         vo_control(vo, VOCTRL_RESTORE_SCREENSAVER, NULL);
         vo_set_paused(vo, true);
         vo_redraw(vo);
         mp_notify(mpctx, MPV_EVENT_VIDEO_RECONFIG, NULL);
     }
+
+    return 0;
+
+err:
+    mpctx->opts->force_vo = 0;
+    uninit_video_out(mpctx);
+    MP_FATAL(mpctx, "Error opening/initializing the VO window.\n");
+    return -1;
 }
 
 // Potentially needed by some Lua scripts, which assume TICK always comes.
 static void handle_dummy_ticks(struct MPContext *mpctx)
 {
     if (mpctx->video_status == STATUS_EOF || mpctx->paused) {
-        if (mp_time_sec() - mpctx->last_idle_tick > 0.5) {
+        if (mp_time_sec() - mpctx->last_idle_tick > 0.050) {
             mpctx->last_idle_tick = mp_time_sec();
             mp_notify(mpctx, MPV_EVENT_TICK, NULL);
         }
@@ -949,7 +885,9 @@ static void handle_playback_restart(struct MPContext *mpctx, double endpts)
             if (opts->playing_msg && opts->playing_msg[0]) {
                 char *msg =
                     mp_property_expand_escaped_string(mpctx, opts->playing_msg);
-                MP_INFO(mpctx, "%s\n", msg);
+                struct mp_log *log = mp_log_new(NULL, mpctx->log, "!term-msg");
+                mp_info(log, "%s\n", msg);
+                talloc_free(log);
                 talloc_free(msg);
             }
             if (opts->osd_playing_msg && opts->osd_playing_msg[0]) {
@@ -960,6 +898,7 @@ static void handle_playback_restart(struct MPContext *mpctx, double endpts)
             }
         }
         mpctx->playing_msg_shown = true;
+        MP_VERBOSE(mpctx, "playback restart complete\n");
     }
 }
 
@@ -976,7 +915,7 @@ static void handle_segment_switch(struct MPContext *mpctx, bool end_is_new_segme
      * and video streams to "disabled" at runtime. Handle this by waiting
      * rather than immediately stopping playback due to EOF.
      */
-    if ((mpctx->d_audio || mpctx->d_video) && !prevent_eof &&
+    if ((mpctx->ao_chain || mpctx->vo_chain) && !prevent_eof &&
         mpctx->audio_status == STATUS_EOF &&
         mpctx->video_status == STATUS_EOF)
     {
@@ -987,7 +926,42 @@ static void handle_segment_switch(struct MPContext *mpctx, bool end_is_new_segme
                            .amount = mpctx->timeline[new_part].start
                            }, true);
         } else {
-            mpctx->stop_play = AT_END_OF_FILE;
+            if (!mpctx->stop_play)
+                mpctx->stop_play = AT_END_OF_FILE;
+        }
+    }
+}
+
+static void handle_complex_filter_decoders(struct MPContext *mpctx)
+{
+    if (!mpctx->lavfi)
+        return;
+
+    for (int n = 0; n < mpctx->num_tracks; n++) {
+        struct track *track = mpctx->tracks[n];
+        if (!track->selected)
+            continue;
+        if (!track->sink || !lavfi_needs_input(track->sink))
+            continue;
+        if (track->d_audio) {
+            audio_work(track->d_audio);
+            struct mp_audio *fr;
+            int res = audio_get_frame(track->d_audio, &fr);
+            if (res == DATA_OK) {
+                lavfi_send_frame_a(track->sink, fr);
+            } else {
+                lavfi_send_status(track->sink, res);
+            }
+        }
+        if (track->d_video) {
+            video_work(track->d_video);
+            struct mp_image *fr;
+            int res = video_get_frame(track->d_video, &fr);
+            if (res == DATA_OK) {
+                lavfi_send_frame_v(track->sink, fr);
+            } else {
+                lavfi_send_status(track->sink, res);
+            }
         }
     }
 }
@@ -1014,6 +988,8 @@ void run_playloop(struct MPContext *mpctx)
         }
     }
 
+    handle_complex_filter_decoders(mpctx);
+
     handle_cursor_autohide(mpctx);
     handle_vo_events(mpctx);
     handle_heartbeat_cmd(mpctx);
@@ -1021,6 +997,13 @@ void run_playloop(struct MPContext *mpctx)
 
     fill_audio_out_buffers(mpctx, endpts);
     write_video(mpctx, endpts);
+
+    if (mpctx->lavfi) {
+        if (lavfi_process(mpctx->lavfi))
+            mpctx->sleeptime = 0;
+        if (lavfi_has_failed(mpctx->lavfi))
+            mpctx->stop_play = AT_END_OF_FILE;
+    }
 
     handle_playback_restart(mpctx, endpts);
 
@@ -1035,11 +1018,10 @@ void run_playloop(struct MPContext *mpctx)
     handle_dummy_ticks(mpctx);
 
     update_osd_msg(mpctx);
-    update_subtitles(mpctx);
+    if (!mpctx->video_out)
+        update_subtitles(mpctx, mpctx->playback_pts);
 
     handle_segment_switch(mpctx, end_is_new_segment);
-
-    mp_handle_nav(mpctx);
 
     handle_loop_file(mpctx);
 
@@ -1055,13 +1037,11 @@ void run_playloop(struct MPContext *mpctx)
     handle_osd_redraw(mpctx);
 
     mp_wait_events(mpctx, mpctx->sleeptime);
-    mpctx->sleeptime = 100.0; // infinite for all practical purposes
+    mpctx->sleeptime = 1e9; // infinite for all practical purposes
 
     handle_pause_on_low_cache(mpctx);
 
     mp_process_input(mpctx);
-
-    handle_backstep(mpctx);
 
     handle_chapter_change(mpctx);
 
@@ -1092,10 +1072,10 @@ void idle_loop(struct MPContext *mpctx)
            && mpctx->stop_play != PT_QUIT)
     {
         if (need_reinit) {
-            mp_notify(mpctx, MPV_EVENT_IDLE, NULL);
             uninit_audio_out(mpctx);
             handle_force_window(mpctx, true);
             mpctx->sleeptime = 0;
+            mp_notify(mpctx, MPV_EVENT_IDLE, NULL);
             need_reinit = false;
         }
         mp_idle(mpctx);

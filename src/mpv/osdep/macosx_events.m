@@ -25,7 +25,7 @@
 #import <IOKit/hidsystem/ev_keymap.h>
 #import <Cocoa/Cocoa.h>
 
-#include "talloc.h"
+#include "mpv_talloc.h"
 #include "input/event.h"
 #include "input/input.h"
 #include "input/keycodes.h"
@@ -472,7 +472,7 @@ void cocoa_set_input_context(struct input_ctx *input_context)
     }];
     [_input_lock lock];
     if (_inputContext)
-        mp_event_drop_files(_inputContext, num_files, files_utf8);
+        mp_event_drop_files(_inputContext, num_files, files_utf8, DND_REPLACE);
     [_input_lock unlock];
     talloc_free(files_utf8);
 }

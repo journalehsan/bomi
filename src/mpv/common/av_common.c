@@ -1,18 +1,18 @@
 /*
  * This file is part of mpv.
  *
- * mpv is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
+ * mpv is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * mpv is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * GNU Lesser General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License along
- * with mpv.  If not, see <http://www.gnu.org/licenses/>.
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 #include <assert.h>
@@ -59,15 +59,13 @@ void mp_copy_lav_codec_headers(AVCodecContext *avctx, AVCodecContext *st)
     avctx->width                    = st->width;
     avctx->height                   = st->height;
     avctx->pix_fmt                  = st->pix_fmt;
-    avctx->sample_aspect_ratio      = st->sample_aspect_ratio;
     avctx->chroma_sample_location   = st->chroma_sample_location;
     avctx->sample_rate              = st->sample_rate;
     avctx->channels                 = st->channels;
     avctx->block_align              = st->block_align;
     avctx->channel_layout           = st->channel_layout;
     avctx->bits_per_coded_sample    = st->bits_per_coded_sample;
-    // Required in FFmpeg 2.5.x / Libav 11, deprecated afterwards.
-    avctx->stream_codec_tag         = st->stream_codec_tag;
+    avctx->has_b_frames             = st->has_b_frames;
 }
 
 // We merely pass-through our PTS/DTS as an int64_t; libavcodec won't use it.

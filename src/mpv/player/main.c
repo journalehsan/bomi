@@ -25,7 +25,7 @@
 #include <signal.h>
 
 #include "config.h"
-#include "talloc.h"
+#include "mpv_talloc.h"
 
 #include "misc/dispatch.h"
 #include "osdep/io.h"
@@ -97,6 +97,11 @@ const char mp_help_text[] =
 "\n";
 
 static const char def_config[] =
+#if HAVE_RPI
+    "hwdec=rpi\n"
+    "fullscreen=yes\n"
+#endif
+    "\n"
     "[pseudo-gui]\n"
     "terminal=no\n"
     "force-window=yes\n"
@@ -156,7 +161,7 @@ void mp_print_version(struct mp_log *log, int always)
 {
     int v = always ? MSGL_INFO : MSGL_V;
     mp_msg(log, v,
-           "%s (C) 2000-2015 mpv/MPlayer/mplayer2 projects\n built on %s\n",
+           "%s (C) 2000-2016 mpv/MPlayer/mplayer2 projects\n built on %s\n",
            mpv_version, mpv_builddate);
     print_libav_versions(log, v);
     mp_msg(log, v, "\n");
@@ -348,6 +353,7 @@ struct MPContext *mp_create(void)
     mpctx->mconfig->includefunc_ctx = mpctx;
     mpctx->mconfig->use_profiles = true;
     mpctx->mconfig->is_toplevel = true;
+    mpctx->mconfig->global = mpctx->global;
     m_config_parse(mpctx->mconfig, "", bstr0(def_config), NULL, 0);
 
     mpctx->global->opts = mpctx->opts;
@@ -431,7 +437,7 @@ int mp_initialize(struct MPContext *mpctx, char **options)
         mpctx->encode_lavc_ctx = encode_lavc_init(opts->encode_opts,
                                                   mpctx->global);
         if(!mpctx->encode_lavc_ctx) {
-            MP_INFO(mpctx, "Encoding initialization failed.");
+            MP_INFO(mpctx, "Encoding initialization failed.\n");
             return -1;
         }
         m_config_set_profile(mpctx->mconfig, "encoding", 0);
@@ -463,22 +469,8 @@ int mp_initialize(struct MPContext *mpctx, char **options)
     if (opts->consolecontrols && cas_terminal_owner(mpctx, mpctx))
         terminal_setup_getch(mpctx->input);
 
-    if (opts->force_vo) {
-        struct vo_extra ex = {
-            .input_ctx = mpctx->input,
-            .osd = mpctx->osd,
-            .encode_lavc_ctx = mpctx->encode_lavc_ctx,
-        };
-        mpctx->video_out = init_best_video_out(mpctx->global, &ex);
-        if (!mpctx->video_out) {
-            MP_FATAL(mpctx, "Error opening/initializing "
-                    "the selected video_out (-vo) device.\n");
-            return -1;
-        }
-        if (opts->force_vo == 2)
-            handle_force_window(mpctx, false);
-        mpctx->mouse_cursor_visible = true;
-    }
+    if (opts->force_vo == 2 && handle_force_window(mpctx, false) < 0)
+        return -1;
 
 #if !defined(__MINGW32__)
     mpctx->ipc_ctx = mp_init_ipc(mpctx->clients, mpctx->global);

@@ -9,17 +9,25 @@
 #include "video/mp_image.h"
 #include "video/hwdec.h"
 
+#define HWDEC_DELAY_QUEUE_COUNT 2
+
 typedef struct lavc_ctx {
     struct mp_log *log;
     struct MPOpts *opts;
     AVCodecContext *avctx;
     AVFrame *pic;
     struct vd_lavc_hwdec *hwdec;
+    AVRational codec_timebase;
     enum AVPixelFormat pix_fmt;
-    int best_csp;
     enum AVDiscard skip_frame;
-    const char *software_fallback_decoder;
+    bool flushing;
+    const char *decoder;
     bool hwdec_failed;
+    bool hwdec_notified;
+
+    struct mp_image **delay_queue;
+    int num_delay_queue;
+    int max_delay_queue;
 
     // From VO
     struct mp_hwdec_info *hwdec_info;
@@ -33,6 +41,7 @@ typedef struct lavc_ctx {
     int hwdec_profile;
 
     bool hwdec_request_reinit;
+    int hwdec_fail_count;
 } vd_ffmpeg_ctx;
 
 struct vd_lavc_hwdec {
@@ -43,19 +52,18 @@ struct vd_lavc_hwdec {
     int (*probe)(struct vd_lavc_hwdec *hwdec, struct mp_hwdec_info *info,
                  const char *decoder);
     int (*init)(struct lavc_ctx *ctx);
-    int (*init_decoder)(struct lavc_ctx *ctx, int fmt, int w, int h);
+    int (*init_decoder)(struct lavc_ctx *ctx, int w, int h);
     void (*uninit)(struct lavc_ctx *ctx);
     // Note: if init_decoder is set, this will always use the values from the
     //       last successful init_decoder call. Otherwise, it's up to you.
-    struct mp_image *(*allocate_image)(struct lavc_ctx *ctx, int fmt,
-                                       int w, int h);
+    struct mp_image *(*allocate_image)(struct lavc_ctx *ctx, int w, int h);
     // Process the image returned by the libavcodec decoder.
     struct mp_image *(*process_image)(struct lavc_ctx *ctx, struct mp_image *img);
     // For horrible Intel shit-drivers only
     void (*lock)(struct lavc_ctx *ctx);
     void (*unlock)(struct lavc_ctx *ctx);
     // Optional; if a special hardware decoder is needed (instead of "hwaccel").
-    const char *(*get_codec)(struct lavc_ctx *ctx);
+    const char *(*get_codec)(struct lavc_ctx *ctx, const char *codec);
 };
 
 enum {

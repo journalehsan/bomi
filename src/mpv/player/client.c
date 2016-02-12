@@ -21,6 +21,7 @@
 #include <assert.h>
 
 #include "common/common.h"
+#include "common/global.h"
 #include "common/msg.h"
 #include "common/msg_control.h"
 #include "input/input.h"
@@ -137,6 +138,7 @@ void mp_clients_init(struct MPContext *mpctx)
     *mpctx->clients = (struct mp_client_api) {
         .mpctx = mpctx,
     };
+    mpctx->global->client_api = mpctx->clients;
     pthread_mutex_init(&mpctx->clients->lock, NULL);
 }
 
@@ -262,6 +264,11 @@ struct mp_log *mp_client_get_log(struct mpv_handle *ctx)
 struct MPContext *mp_client_get_core(struct mpv_handle *ctx)
 {
     return ctx->mpctx;
+}
+
+struct MPContext *mp_client_api_get_core(struct mp_client_api *api)
+{
+    return api->mpctx;
 }
 
 static void wakeup_client(struct mpv_handle *ctx)
@@ -451,7 +458,7 @@ void mpv_terminate_destroy(mpv_handle *ctx)
 static bool check_locale(void)
 {
     char *name = setlocale(LC_NUMERIC, NULL);
-    return strcmp(name, "C") == 0;
+    return !name || strcmp(name, "C") == 0;
 }
 
 mpv_handle *mpv_create(void)
@@ -710,6 +717,8 @@ int mp_client_send_event_dup(struct MPContext *mpctx, const char *client_name,
 int mpv_request_event(mpv_handle *ctx, mpv_event_id event, int enable)
 {
     if (!mpv_event_name(event) || enable < 0 || enable > 1)
+        return MPV_ERROR_INVALID_PARAMETER;
+    if (event == MPV_EVENT_SHUTDOWN && !enable)
         return MPV_ERROR_INVALID_PARAMETER;
     assert(event < (int)INTERNAL_EVENT_BASE); // excluded above; they have no name
     pthread_mutex_lock(&ctx->lock);
@@ -1193,7 +1202,7 @@ static void getproperty_fn(void *arg)
         char *s = NULL;
         err = mp_property_do(req->name, M_PROPERTY_GET_STRING, &s, req->mpctx);
         if (err == M_PROPERTY_OK)
-            *(char **)req->data = s;
+            *(char **)data = s;
         break;
     }
     case MPV_FORMAT_NODE:
@@ -1523,6 +1532,9 @@ int mpv_request_log_messages(mpv_handle *ctx, const char *min_level)
             break;
         }
     }
+    if (strcmp(min_level, "terminal-default") == 0)
+        level = MP_LOG_BUFFER_MSGL_TERM;
+
     if (level < 0 && strcmp(min_level, "no") != 0)
         return MPV_ERROR_INVALID_PARAMETER;
 
@@ -1547,6 +1559,7 @@ static bool gen_log_message_event(struct mpv_handle *ctx)
         if (msg) {
             struct mpv_event_log_message *cmsg =
                 talloc_ptrtype(ctx->cur_event, cmsg);
+            talloc_steal(cmsg, msg);
             *cmsg = (struct mpv_event_log_message){
                 .prefix = msg->prefix,
                 .level = mp_log_levels[msg->level],
@@ -1597,7 +1610,7 @@ static const char *const err_table[] = {
     [-MPV_ERROR_LOADING_FAILED] = "loading failed",
     [-MPV_ERROR_AO_INIT_FAILED] = "audio output initialization failed",
     [-MPV_ERROR_VO_INIT_FAILED] = "audio output initialization failed",
-    [-MPV_ERROR_NOTHING_TO_PLAY] = "the file has no audio or video data",
+    [-MPV_ERROR_NOTHING_TO_PLAY] = "no audio or video data played",
     [-MPV_ERROR_UNKNOWN_FORMAT] = "unrecognized file format",
     [-MPV_ERROR_UNSUPPORTED] = "not supported",
     [-MPV_ERROR_NOT_IMPLEMENTED] = "operation not implemented",

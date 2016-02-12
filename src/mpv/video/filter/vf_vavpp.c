@@ -1,18 +1,18 @@
 /*
  * This file is part of mpv.
  *
- * mpv is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
+ * mpv is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * mpv is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * GNU Lesser General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License along
- * with mpv.  If not, see <http://www.gnu.org/licenses/>.
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 #include <assert.h>
@@ -58,6 +58,7 @@ struct pipeline {
 
 struct vf_priv_s {
     int deint_type; // 0: none, 1: discard, 2: double fps
+    int interlaced_only;
     bool do_deint;
     VABufferID buffers[VAProcFilterCount];
     int num_buffers;
@@ -86,6 +87,7 @@ static const struct vf_priv_s vf_priv_default = {
     .config = VA_INVALID_ID,
     .context = VA_INVALID_ID,
     .deint_type = 2,
+    .interlaced_only = 1,
 };
 
 // The array items must match with the "deint" suboption values.
@@ -158,9 +160,12 @@ static struct mp_image *render(struct vf_instance *vf, struct mp_image *in,
     if (!p->pipe.filters || in_id == VA_INVALID_ID)
         return NULL;
 
-    struct mp_image *img = mp_image_pool_get(p->pool, IMGFMT_VAAPI, in->w, in->h);
+    int r_w, r_h;
+    va_surface_get_uncropped_size(in, &r_w, &r_h);
+    struct mp_image *img = mp_image_pool_get(p->pool, IMGFMT_VAAPI, r_w, r_h);
     if (!img)
         return NULL;
+    mp_image_set_size(img, in->w, in->h);
 
     bool need_end_picture = false;
     bool success = false;
@@ -199,8 +204,8 @@ static struct mp_image *render(struct vf_instance *vf, struct mp_image *in,
         goto cleanup;
 
     param->surface = in_id;
-    param->surface_region = NULL;
-    param->output_region = NULL;
+    param->surface_region = &(VARectangle){0, 0, in->w, in->h};
+    param->output_region = &(VARectangle){0, 0, img->w, img->h};
     param->output_background_color = 0;
     param->filter_flags = flags;
     param->filters = p->pipe.filters;
@@ -254,6 +259,10 @@ static void output_frames(struct vf_instance *vf)
     }
     unsigned int csp = va_get_colorspace_flag(p->params.colorspace);
     unsigned int field = get_deint_field(p, 0, in);
+    if (field == VA_FRAME_PICTURE && p->interlaced_only) {
+        vf_add_output_frame(vf, mp_image_new_ref(in));
+        return;
+    }
     struct mp_image *out1 = render(vf, in, field | csp);
     if (!out1) { // cannot render
         vf_add_output_frame(vf, mp_image_new_ref(in));
@@ -497,6 +506,7 @@ static const m_option_t vf_opts_fields[] = {
                 {"weave", 3},
                 {"motion-adaptive", 4},
                 {"motion-compensated", 5})),
+    OPT_FLAG("interlaced-only", interlaced_only, 0),
     {0}
 };
 

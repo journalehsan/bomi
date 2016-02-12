@@ -5,18 +5,18 @@
  * of MPlayer (GPL).
  * Copyright (C) 2006 Evgeniy Stepanov <eugeni.stepanov@gmail.com>
  *
- * mpv is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
+ * mpv is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * mpv is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * GNU Lesser General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License along
- * with mpv.  If not, see <http://www.gnu.org/licenses/>.
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 #include <stdlib.h>
@@ -36,6 +36,10 @@
 #include <libguess.h>
 #endif
 
+#if HAVE_UCHARDET
+#include <uchardet.h>
+#endif
+
 #if HAVE_ICONV
 #include <iconv.h>
 #endif
@@ -46,6 +50,13 @@ bool mp_charset_is_utf8(const char *user_cp)
 {
     return user_cp && (strcasecmp(user_cp, "utf8") == 0 ||
                        strcasecmp(user_cp, "utf-8") == 0);
+}
+
+bool mp_charset_is_utf16(const char *user_cp)
+{
+    bstr s = bstr0(user_cp);
+    return bstr_case_startswith(s, bstr0("utf16")) ||
+           bstr_case_startswith(s, bstr0("utf-16"));
 }
 
 // Split the string on ':' into components.
@@ -81,6 +92,7 @@ bool mp_charset_requires_guess(const char *user_cp)
     // Note that "utf8" is the UTF-8 codepage, while "utf8:..." specifies UTF-8
     // by default, plus a codepage that is used if the input is not UTF-8.
     return bstrcasecmp0(res[0], "enca") == 0 ||
+           bstrcasecmp0(res[0], "uchardet") == 0 ||
            bstrcasecmp0(res[0], "auto") == 0 ||
            bstrcasecmp0(res[0], "guess") == 0 ||
            (r > 1 && bstrcasecmp0(res[0], "utf-8") == 0) ||
@@ -102,6 +114,11 @@ static const char *ms_bom_guess(bstr buf)
 #if HAVE_ENCA
 static const char *enca_guess(struct mp_log *log, bstr buf, const char *language)
 {
+    // Do our own UTF-8 detection, because ENCA seems to get it wrong sometimes
+    // (suggested by divVerent). Explicitly allow cut-off UTF-8.
+    if (bstr_validate_utf8(buf) > -8)
+        return "UTF-8";
+
     if (!language || !language[0])
         language = "__"; // neutral language
 
@@ -145,31 +162,59 @@ static const char *libguess_guess(struct mp_log *log, bstr buf,
 }
 #endif
 
+#if HAVE_UCHARDET
+static const char *mp_uchardet(void *talloc_ctx, struct mp_log *log, bstr buf)
+{
+    uchardet_t det = uchardet_new();
+    if (!det)
+        return NULL;
+    if (uchardet_handle_data(det, buf.start, buf.len) != 0) {
+        uchardet_delete(det);
+        return NULL;
+    }
+    uchardet_data_end(det);
+    char *res = talloc_strdup(talloc_ctx, uchardet_get_charset(det));
+    if (res && !res[0])
+        res = NULL;
+    if (res) {
+        iconv_t icdsc = iconv_open("UTF-8", res);
+        if (icdsc == (iconv_t)(-1)) {
+            mp_warn(log, "Charset detected as %s, but not supported by iconv.\n",
+                    res);
+            res = NULL;
+        } else {
+            iconv_close(icdsc);
+        }
+    }
+    if (!res && bstr_validate_utf8(buf) >= 0)
+        res = "utf-8";
+    uchardet_delete(det);
+    return res;
+}
+#endif
+
 // Runs charset auto-detection on the input buffer, and returns the result.
 // If auto-detection fails, NULL is returned.
 // If user_cp doesn't refer to any known auto-detection (for example because
 // it's a real iconv codepage), user_cp is returned without even looking at
 // the buf data.
-const char *mp_charset_guess(struct mp_log *log, bstr buf, const char *user_cp,
-                             int flags)
+// The return value may (but doesn't have to) be allocated under talloc_ctx.
+const char *mp_charset_guess(void *talloc_ctx, struct mp_log *log, bstr buf,
+                             const char *user_cp, int flags)
 {
     if (!mp_charset_requires_guess(user_cp))
         return user_cp;
 
     bool use_auto = strcasecmp(user_cp, "auto") == 0;
     if (use_auto) {
-#if HAVE_ENCA
+#if HAVE_UCHARDET
+        user_cp = "uchardet";
+#elif HAVE_ENCA
         user_cp = "enca";
 #else
         user_cp = "UTF-8:UTF-8-BROKEN";
 #endif
     }
-
-    // Do our own UTF-8 detection, because at least ENCA seems to get it
-    // wrong sometimes (suggested by divVerent).
-    int r = bstr_validate_utf8(buf);
-    if (r >= 0 || (r > -8 && (flags & MP_ICONV_ALLOW_CUTOFF)))
-        return "UTF-8";
 
     bstr params[3] = {{0}};
     split_colon(user_cp, 3, params);
@@ -195,9 +240,17 @@ const char *mp_charset_guess(struct mp_log *log, bstr buf, const char *user_cp,
     if (bstrcasecmp0(type, "guess") == 0)
         res = libguess_guess(log, buf, lang);
 #endif
+#if HAVE_UCHARDET
+    if (bstrcasecmp0(type, "uchardet") == 0)
+        res = mp_uchardet(talloc_ctx, log, buf);
+#endif
+
     if (bstrcasecmp0(type, "utf8") == 0 || bstrcasecmp0(type, "utf-8") == 0) {
         if (!fallback)
             fallback = params[1].start; // must be already 0-terminated
+        int r = bstr_validate_utf8(buf);
+        if (r >= 0 || (r > -8 && (flags & MP_ICONV_ALLOW_CUTOFF)))
+            res = "utf-8";
     }
 
     if (res) {
@@ -211,22 +264,8 @@ const char *mp_charset_guess(struct mp_log *log, bstr buf, const char *user_cp,
     if (!res && !(flags & MP_STRICT_UTF8))
         res = "UTF-8-BROKEN";
 
+    mp_verbose(log, "Using charset '%s'.\n", res);
     return res;
-}
-
-// Convert the data in buf to UTF-8. The charset argument can be an iconv
-// codepage, a value returned by mp_charset_conv_guess(), or a special value
-// that triggers autodetection of the charset (e.g. using ENCA).
-// The auto-detection is the only difference to mp_iconv_to_utf8().
-//  buf: same as mp_iconv_to_utf8()
-//  user_cp: iconv codepage, special value, NULL
-//  flags: same as mp_iconv_to_utf8()
-//  returns: same as mp_iconv_to_utf8()
-bstr mp_charset_guess_and_conv_to_utf8(struct mp_log *log, bstr buf,
-                                       const char *user_cp, int flags)
-{
-    return mp_iconv_to_utf8(log, buf, mp_charset_guess(log, buf, user_cp, flags),
-                            flags);
 }
 
 // Use iconv to convert buf to UTF-8.

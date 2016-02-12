@@ -1,18 +1,18 @@
 /*
  * This file is part of mpv.
  *
- * mpv is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
+ * mpv is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * mpv is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * GNU Lesser General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License along
- * with mpv.  If not, see <http://www.gnu.org/licenses/>.
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 #include <assert.h>
@@ -21,7 +21,7 @@
 #include "common/common.h"
 #include "common/global.h"
 #include "common/msg.h"
-#include "talloc.h"
+#include "mpv_talloc.h"
 #include "options/path.h"
 
 #include "demux/demux.h"
@@ -206,6 +206,18 @@ void playlist_add_base_path(struct playlist *pl, bstr base_path)
     }
 }
 
+// Add redirected_from as new redirect entry to each item in pl.
+void playlist_add_redirect(struct playlist *pl, const char *redirected_from)
+{
+    for (struct playlist_entry *e = pl->first; e; e = e->next) {
+        if (e->num_redirects >= 10) // arbitrary limit for sanity
+            break;
+        char *s = talloc_strdup(e, redirected_from);
+        if (s)
+            MP_TARRAY_APPEND(e, e->redirects, e->num_redirects, s);
+    }
+}
+
 // Move all entries from source_pl to pl, appending them after the current entry
 // of pl. source_pl will be empty, and all entries have changed ownership to pl.
 void playlist_transfer_entries(struct playlist *pl, struct playlist *source_pl)
@@ -281,6 +293,10 @@ struct playlist *playlist_parse_file(const char *file, struct mpv_global *global
     if (d && d->playlist) {
         ret = talloc_zero(NULL, struct playlist);
         playlist_transfer_entries(ret, d->playlist);
+        if (d->filetype && strcmp(d->filetype, "hls") == 0) {
+            mp_warn(log, "This might be a HLS stream. For correct operation, "
+                         "pass it to the player\ndirectly. Don't use --playlist.\n");
+        }
     }
     free_demuxer_and_stream(d);
 

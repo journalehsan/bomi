@@ -25,7 +25,7 @@
 #include <libavcodec/vaapi.h>
 #include <libavutil/common.h>
 
-#include <X11/Xlib.h>
+#include "config.h"
 
 #include "lavc.h"
 #include "common/common.h"
@@ -40,15 +40,11 @@
  * The VAAPI decoder can work only with surfaces passed to the decoder at
  * creation time. This means all surfaces have to be created in advance.
  * So, additionally to the maximum number of reference frames, we need
- * surfaces for:
- * - 1 decode frame
- * - decoding 2 frames ahead (done by generic playback code)
- * - keeping the reference to the previous frame (done by vo_vaapi.c)
- * - keeping the reference to a dropped frame (done by vo.c)
+ * surfaces for all kinds of buffering between decoder and VO.
  * Note that redundant additional surfaces also might allow for some
  * buffering (i.e. not trying to reuse a surface while it's busy).
  */
-#define ADDTIONAL_SURFACES 5
+#define ADDTIONAL_SURFACES MPMAX(6, HWDEC_DELAY_QUEUE_COUNT)
 
 // Some upper bound.
 #define MAX_SURFACES 25
@@ -57,7 +53,9 @@ struct priv {
     struct mp_log *log;
     struct mp_vaapi_ctx *ctx;
     VADisplay display;
-    Display *x11_display;
+
+    const struct va_native_display *native_display_fns;
+    void *native_display;
 
     // libavcodec shared struct
     struct vaapi_context *va_context;
@@ -68,6 +66,50 @@ struct priv {
 
     struct mp_image_pool *sw_pool;
 };
+
+struct va_native_display {
+    void (*create)(struct priv *p);
+    void (*destroy)(struct priv *p);
+};
+
+static const struct va_native_display disp_x11;
+
+static const struct va_native_display *const native_displays[] = {
+#if HAVE_VAAPI_X11
+    &disp_x11,
+#endif
+    NULL
+};
+
+#if HAVE_VAAPI_X11
+#include <X11/Xlib.h>
+#include <va/va_x11.h>
+
+static void x11_destroy(struct priv *p)
+{
+    if (p->native_display)
+        XCloseDisplay(p->native_display);
+    p->native_display = NULL;
+}
+
+static void x11_create(struct priv *p)
+{
+    p->native_display = XOpenDisplay(NULL);
+    if (!p->native_display)
+        return;
+    p->display = vaGetDisplay(p->native_display);
+    if (!p->display)
+        x11_destroy(p);
+}
+
+static const struct va_native_display disp_x11 = {
+    .create = x11_create,
+    .destroy = x11_destroy,
+};
+#endif
+
+#define HAS_HEVC VA_CHECK_VERSION(0, 38, 0)
+#define HAS_VP9 (VA_CHECK_VERSION(0, 38, 1) && defined(FF_PROFILE_VP9_0))
 
 #define PE(av_codec_id, ff_profile, vdp_profile)                \
     {AV_CODEC_ID_ ## av_codec_id, FF_PROFILE_ ## ff_profile,    \
@@ -88,9 +130,12 @@ static const struct hwdec_profile_entry profiles[] = {
     PE(WMV3,        VC1_ADVANCED,       VC1Advanced),
     PE(WMV3,        VC1_MAIN,           VC1Main),
     PE(WMV3,        VC1_SIMPLE,         VC1Simple),
-#if VA_CHECK_VERSION(0, 37, 0)
+#if HAS_HEVC
     PE(HEVC,        HEVC_MAIN,          HEVCMain),
     PE(HEVC,        HEVC_MAIN_10,       HEVCMain10),
+#endif
+#if HAS_VP9
+    PE(VP9,         VP9_0,              VP9Profile0),
 #endif
     {0}
 };
@@ -111,9 +156,12 @@ static const char *str_va_profile(VAProfile profile)
         PROFILE(VC1Simple);
         PROFILE(VC1Main);
         PROFILE(VC1Advanced);
-#if VA_CHECK_VERSION(0, 37, 0)
+#if HAS_HEVC
         PROFILE(HEVCMain);
         PROFILE(HEVCMain10);
+#endif
+#if HAS_VP9
+        PROFILE(VP9Profile0);
 #endif
 #undef PROFILE
     }
@@ -191,7 +239,7 @@ static bool has_profile(VAProfile *va_profiles, int num_profiles, VAProfile p)
     return false;
 }
 
-static int init_decoder(struct lavc_ctx *ctx, int fmt, int w, int h)
+static int init_decoder(struct lavc_ctx *ctx, int w, int h)
 {
     void *tmp = talloc_new(NULL);
 
@@ -282,15 +330,13 @@ error:
     return res;
 }
 
-static struct mp_image *allocate_image(struct lavc_ctx *ctx, int format,
-                                       int w, int h)
+static struct mp_image *allocate_image(struct lavc_ctx *ctx, int w, int h)
 {
     struct priv *p = ctx->hwdec_priv;
 
-    struct mp_image *img =
-        mp_image_pool_get_no_alloc(p->pool, IMGFMT_VAAPI, w, h);
+    struct mp_image *img = mp_image_pool_get(p->pool, IMGFMT_VAAPI, w, h);
     if (!img)
-        MP_ERR(p, "Insufficient number of surfaces.\n");
+        MP_ERR(p, "Failed to allocate additional VAAPI surface.\n");
     return img;
 }
 
@@ -299,9 +345,8 @@ static void destroy_va_dummy_ctx(struct priv *p)
     va_destroy(p->ctx);
     p->ctx = NULL;
     p->display = NULL;
-    if (p->x11_display)
-        XCloseDisplay(p->x11_display);
-    p->x11_display = NULL;
+    if (p->native_display_fns)
+        p->native_display_fns->destroy(p);
 }
 
 // Creates a "private" VADisplay, disconnected from the VO. We just create a
@@ -309,15 +354,18 @@ static void destroy_va_dummy_ctx(struct priv *p)
 // connection along with struct mp_hwdec_info, if we wanted.)
 static bool create_va_dummy_ctx(struct priv *p)
 {
-    p->x11_display = XOpenDisplay(NULL);
-    if (!p->x11_display)
+    for (int n = 0; native_displays[n]; n++) {
+        native_displays[n]->create(p);
+        if (p->display) {
+            p->native_display_fns = native_displays[n];
+            break;
+        }
+    }
+    if (!p->display)
         goto destroy_ctx;
-    VADisplay *display = vaGetDisplay(p->x11_display);
-    if (!display)
-        goto destroy_ctx;
-    p->ctx = va_initialize(display, p->log);
+    p->ctx = va_initialize(p->display, p->log, true);
     if (!p->ctx) {
-        vaTerminate(display);
+        vaTerminate(p->display);
         goto destroy_ctx;
     }
     return true;
@@ -338,7 +386,7 @@ static void uninit(struct lavc_ctx *ctx)
     talloc_free(p->pool);
     p->pool = NULL;
 
-    if (p->x11_display)
+    if (p->native_display_fns)
         destroy_va_dummy_ctx(p);
 
     talloc_free(p);

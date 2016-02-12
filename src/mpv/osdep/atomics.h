@@ -2,18 +2,18 @@
  * This file is part of mpv.
  * Copyright (c) 2013 Stefano Pigozzi <stefano.pigozzi@gmail.com>
  *
- * mpv is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
+ * mpv is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * mpv is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * GNU Lesser General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License along
- * with mpv.  If not, see <http://www.gnu.org/licenses/>.
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 #ifndef MP_ATOMICS_H
@@ -21,8 +21,6 @@
 
 #include <inttypes.h>
 #include "config.h"
-
-#define HAVE_ATOMICS 1
 
 #if HAVE_STDATOMIC
 #include <stdatomic.h>
@@ -96,9 +94,6 @@ typedef struct { volatile unsigned long long v, t;  } atomic_ullong;
 #define atomic_fetch_or(a, b) atomic_fetch_op_(a, b, |)
 #define atomic_compare_exchange_strong(p, old, new) \
     ((p)->v == *(old) ? ((p)->v = (new), 1) : (*(old) = (p)->v, 0))
-
-#undef HAVE_ATOMICS
-#define HAVE_ATOMICS 0
 
 #endif /* no atomics */
 

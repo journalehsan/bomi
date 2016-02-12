@@ -29,11 +29,12 @@
 #include "config.h"
 #include "options/options.h"
 #include "options/m_option.h"
-#include "talloc.h"
+#include "mpv_talloc.h"
 #include "vo.h"
 #include "video/csputils.h"
 #include "video/mp_image.h"
 #include "video/img_format.h"
+#include "video/d3d.h"
 #include "common/msg.h"
 #include "common/common.h"
 #include "w32_common.h"
@@ -191,6 +192,10 @@ typedef struct d3d_priv {
     struct mp_csp_equalizer video_eq;
 
     struct osdpart *osd[MAX_OSD_PARTS];
+
+    struct mp_hwdec_info hwdec_info;
+    struct mp_hwdec_ctx hwdec_ctx;
+    struct mp_d3d_ctx hwdec_d3d;
 } d3d_priv;
 
 struct fmt_entry {
@@ -217,8 +222,6 @@ static const struct fmt_entry fmt_table[] = {
     {IMGFMT_RGB32, D3DFMT_X8B8G8R8},
     {IMGFMT_BGR24, D3DFMT_R8G8B8}, //untested
     {IMGFMT_RGB565, D3DFMT_R5G6B5},
-    {IMGFMT_RGB555, D3DFMT_X1R5G5B5},
-    {IMGFMT_RGB8,  D3DFMT_R3G3B2}, //untested
     // grayscale (can be considered both packed and planar)
     {IMGFMT_Y8,    D3DFMT_L8},
     {IMGFMT_Y16,   D3DFMT_L16},
@@ -733,12 +736,16 @@ static bool change_d3d_backbuffer(d3d_priv *priv)
                                            D3DADAPTER_DEFAULT,
                                            DEVTYPE, vo_w32_hwnd(priv->vo),
                                            D3DCREATE_SOFTWARE_VERTEXPROCESSING
-                                           | D3DCREATE_FPU_PRESERVE,
+                                           | D3DCREATE_FPU_PRESERVE
+                                           | D3DCREATE_MULTITHREADED,
                                            &present_params, &priv->d3d_device)))
         {
             MP_VERBOSE(priv, "Creating Direct3D device failed.\n");
             return 0;
         }
+
+        // (race condition if this is called when recovering from a "lost" device)
+        priv->hwdec_d3d.d3d9_device = priv->d3d_device;
     } else {
         if (FAILED(IDirect3DDevice9_Reset(priv->d3d_device, &present_params))) {
             MP_ERR(priv, "Reseting Direct3D device failed.\n");
@@ -772,6 +779,8 @@ static bool change_d3d_backbuffer(d3d_priv *priv)
 
 static void destroy_d3d(d3d_priv *priv)
 {
+    priv->hwdec_d3d.d3d9_device = NULL;
+
     destroy_d3d_surfaces(priv);
 
     for (int n = 0; n < NUM_SHADERS; n++) {
@@ -1194,7 +1203,7 @@ static void update_colorspace(d3d_priv *priv)
         csp.texture_bits = (csp.input_bits + 7) & ~7;
 
         struct mp_cmat coeff;
-        mp_get_yuv2rgb_coeffs(&csp, &coeff);
+        mp_get_csp_matrix(&csp, &coeff);
         for (int row = 0; row < 3; row++) {
             for (int col = 0; col < 3; col++)
                 priv->d3d_colormatrix.m[row][col] = coeff.m[row][col];
@@ -1215,6 +1224,9 @@ static int preinit(struct vo *vo)
     d3d_priv *priv = vo->priv;
     priv->vo = vo;
     priv->log = vo->log;
+
+    priv->hwdec_info.hwctx = &priv->hwdec_ctx;
+    priv->hwdec_ctx.d3d_ctx = &priv->hwdec_d3d;
 
     for (int n = 0; n < MAX_OSD_PARTS; n++) {
         struct osdpart *osd = talloc_ptrtype(priv, osd);
@@ -1263,6 +1275,11 @@ static int control(struct vo *vo, uint32_t request, void *data)
     d3d_priv *priv = vo->priv;
 
     switch (request) {
+    case VOCTRL_GET_HWDEC_INFO: {
+        struct mp_hwdec_info **arg = data;
+        *arg = &priv->hwdec_info;
+        return true;
+    }
     case VOCTRL_REDRAW_FRAME:
         d3d_draw_frame(priv);
         return VO_TRUE;
@@ -1308,19 +1325,13 @@ static int control(struct vo *vo, uint32_t request, void *data)
     return r;
 }
 
-static int reconfig(struct vo *vo, struct mp_image_params *params, int flags)
+static int reconfig(struct vo *vo, struct mp_image_params *params)
 {
     d3d_priv *priv = vo->priv;
 
     priv->have_image = false;
 
-    /* w32_common framework call. Creates window on the screen with
-     * the given coordinates.
-     */
-    if (!vo_w32_config(vo, flags)) {
-        MP_VERBOSE(priv, "Creating window failed.\n");
-        return VO_ERROR;
-    }
+    vo_w32_config(vo);
 
     if ((priv->image_format != params->imgfmt)
         || (priv->src_width != params->w)

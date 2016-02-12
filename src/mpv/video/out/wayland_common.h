@@ -2,18 +2,18 @@
  * This file is part of mpv video player.
  * Copyright © 2013 Alexander Preisinger <alexander.preisinger@gmail.com>
  *
- * mpv is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
+ * mpv is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * mpv is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * GNU Lesser General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License along
- * with mpv.  If not, see <http://www.gnu.org/licenses/>.
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 #ifndef MPLAYER_WAYLAND_COMMON_H
@@ -47,14 +47,19 @@ struct vo_wayland_output {
     struct wl_list link;
 };
 
+typedef void (*vo_wayland_frame_cb)(void *data, uint32_t time);
 
 struct vo_wayland_state {
     struct vo *vo;
     struct mp_log* log;
 
     struct {
+        void *data;
+        vo_wayland_frame_cb function;
         struct wl_callback *callback;
+        uint64_t last_us;
         bool pending;
+        bool dropping;
     } frame;
 
 #if HAVE_GL_WAYLAND
@@ -142,8 +147,10 @@ struct vo_wayland_state {
 
 int vo_wayland_init(struct vo *vo);
 void vo_wayland_uninit(struct vo *vo);
-bool vo_wayland_config(struct vo *vo, uint32_t flags);
+bool vo_wayland_config(struct vo *vo);
 int vo_wayland_control(struct vo *vo, int *events, int request, void *arg);
+void vo_wayland_request_frame(struct vo *vo, void *data, vo_wayland_frame_cb cb);
+bool vo_wayland_wait_frame(struct vo *vo);
 
 #endif /* MPLAYER_WAYLAND_COMMON_H */
 

@@ -39,7 +39,7 @@
 #include "video/hwdec.h"
 #include "common/msg.h"
 #include "options/options.h"
-#include "talloc.h"
+#include "mpv_talloc.h"
 #include "vo.h"
 #include "x11_common.h"
 #include "video/csputils.h"
@@ -81,8 +81,11 @@ struct vdpctx {
     VdpOutputSurface                   output_surfaces[MAX_OUTPUT_SURFACES];
     int                                num_output_surfaces;
     VdpOutputSurface                   black_pixel;
+    VdpOutputSurface                   rotation_surface;
 
     struct mp_image                   *current_image;
+    int64_t                            current_pts;
+    int                                current_duration;
 
     int                                output_surface_w, output_surface_h;
 
@@ -101,13 +104,14 @@ struct vdpctx {
     VdpRect                            src_rect_vid;
     VdpRect                            out_rect_vid;
     struct mp_osd_res                  osd_rect;
+    VdpBool                            supports_a8;
 
     int                                surface_num; // indexes output_surfaces
     int                                query_surface_num;
     VdpTime                            recent_vsync_time;
     float                              user_fps;
     int                                composite_detect;
-    unsigned int                       vsync_interval;
+    int                                vsync_interval;
     uint64_t                           last_queue_time;
     uint64_t                           queue_time[MAX_OUTPUT_SURFACES];
     uint64_t                           last_ideal_time;
@@ -163,7 +167,7 @@ static int render_video_to_output_surface(struct vo *vo,
     // Clear the borders between video and window (if there are any).
     // For some reason, video_mixer_render doesn't need it for YUV.
     // Also, if there is nothing to render, at least clear the screen.
-    if (vc->rgb_mode || !mpi) {
+    if (vc->rgb_mode || !mpi || mpi->params.rotate != 0) {
         int flags = VDP_OUTPUT_SURFACE_RENDER_ROTATE_0;
         vdp_st = vdp->output_surface_render_output_surface(output_surface,
                                                            NULL, vc->black_pixel,
@@ -188,8 +192,50 @@ static int render_video_to_output_surface(struct vo *vo,
     if (vc->hqscaling)
         opts.hqscaling = vc->hqscaling;
 
-    mp_vdpau_mixer_render(vc->video_mixer, &opts, output_surface, output_rect,
-                          mpi, video_rect);
+    if (mpi->params.rotate != 0) {
+        int flags;
+        VdpRect r_rect;
+        switch (mpi->params.rotate) {
+        case 90:
+            r_rect.y0 = output_rect->x0;
+            r_rect.y1 = output_rect->x1;
+            r_rect.x0 = output_rect->y0;
+            r_rect.x1 = output_rect->y1;
+            flags = VDP_OUTPUT_SURFACE_RENDER_ROTATE_90;
+            break;
+        case 180:
+            r_rect.x0 = output_rect->x0;
+            r_rect.x1 = output_rect->x1;
+            r_rect.y0 = output_rect->y0;
+            r_rect.y1 = output_rect->y1;
+            flags = VDP_OUTPUT_SURFACE_RENDER_ROTATE_180;
+            break;
+        case 270:
+            r_rect.y0 = output_rect->x0;
+            r_rect.y1 = output_rect->x1;
+            r_rect.x0 = output_rect->y0;
+            r_rect.x1 = output_rect->y1;
+            flags = VDP_OUTPUT_SURFACE_RENDER_ROTATE_270;
+            break;
+        default:
+            MP_ERR(vo, "Unsupported rotation angle: %u\n", mpi->params.rotate);
+            return -1;
+        }
+
+        mp_vdpau_mixer_render(vc->video_mixer, &opts, vc->rotation_surface,
+                              &r_rect, mpi, video_rect);
+        vdp_st = vdp->output_surface_render_output_surface(output_surface,
+                                                           output_rect,
+                                                           vc->rotation_surface,
+                                                           &r_rect,
+                                                           NULL,
+                                                           NULL,
+                                                           flags);
+        CHECK_VDP_WARNING(vo, "Error rendering rotated frame");
+    } else {
+        mp_vdpau_mixer_render(vc->video_mixer, &opts, output_surface,
+                              output_rect, mpi, video_rect);
+    }
     return 0;
 }
 
@@ -233,10 +279,17 @@ static void resize(struct vo *vo)
     vc->out_rect_vid.x1 = dst_rect.x1;
     vc->out_rect_vid.y0 = dst_rect.y0;
     vc->out_rect_vid.y1 = dst_rect.y1;
-    vc->src_rect_vid.x0 = src_rect.x0;
-    vc->src_rect_vid.x1 = src_rect.x1;
-    vc->src_rect_vid.y0 = src_rect.y0;
-    vc->src_rect_vid.y1 = src_rect.y1;
+    if (vo->params->rotate == 90 || vo->params->rotate == 270) {
+        vc->src_rect_vid.y0 = src_rect.x0;
+        vc->src_rect_vid.y1 = src_rect.x1;
+        vc->src_rect_vid.x0 = src_rect.y0;
+        vc->src_rect_vid.x1 = src_rect.y1;
+    } else {
+        vc->src_rect_vid.x0 = src_rect.x0;
+        vc->src_rect_vid.x1 = src_rect.x1;
+        vc->src_rect_vid.y0 = src_rect.y0;
+        vc->src_rect_vid.y1 = src_rect.y1;
+    }
 
     VdpBool ok;
     uint32_t max_w, max_h;
@@ -249,7 +302,7 @@ static void resize(struct vo *vo)
     vc->flip_offset_us = vo->opts->fullscreen ?
                          1000LL * vc->flip_offset_fs :
                          1000LL * vc->flip_offset_window;
-    vo_set_flip_queue_params(vo, vc->flip_offset_us, false);
+    vo_set_queue_params(vo, vc->flip_offset_us, 1);
 
     if (vc->output_surface_w < vo->dwidth || vc->output_surface_h < vo->dheight) {
         vc->output_surface_w = s_size(max_w, vc->output_surface_w, vo->dwidth);
@@ -271,6 +324,27 @@ static void resize(struct vo *vo)
             MP_DBG(vo, "vdpau out create: %u\n",
                    vc->output_surfaces[i]);
         }
+        if (vc->rotation_surface != VDP_INVALID_HANDLE) {
+            vdp_st = vdp->output_surface_destroy(vc->rotation_surface);
+            CHECK_VDP_WARNING(vo, "Error when calling "
+                              "vdp_output_surface_destroy");
+        }
+        if (vo->params->rotate == 90 || vo->params->rotate == 270) {
+            vdp_st = vdp->output_surface_create(vc->vdp_device,
+                                                OUTPUT_RGBA_FORMAT,
+                                                vc->output_surface_h,
+                                                vc->output_surface_w,
+                                                &vc->rotation_surface);
+        } else if (vo->params->rotate == 180) {
+            vdp_st = vdp->output_surface_create(vc->vdp_device,
+                                                OUTPUT_RGBA_FORMAT,
+                                                vc->output_surface_w,
+                                                vc->output_surface_h,
+                                                &vc->rotation_surface);
+        }
+        CHECK_VDP_WARNING(vo, "Error when calling vdp_output_surface_create");
+        MP_DBG(vo, "vdpau rotation surface create: %u\n",
+               vc->rotation_surface);
     }
     vo->want_redraw = true;
 }
@@ -379,6 +453,7 @@ static void mark_vdpau_objects_uninitialized(struct vo *vo)
     vc->flip_target = VDP_INVALID_HANDLE;
     for (int i = 0; i < MAX_OUTPUT_SURFACES; i++)
         vc->output_surfaces[i] = VDP_INVALID_HANDLE;
+    vc->rotation_surface = VDP_INVALID_HANDLE;
     vc->vdp_device = VDP_INVALID_HANDLE;
     for (int i = 0; i < MAX_OSD_PARTS; i++) {
         struct osd_bitmap_surface *sfc = &vc->osd_surfaces[i];
@@ -416,7 +491,7 @@ static bool status_ok(struct vo *vo)
  * connect to X server, create and map window, initialize all
  * VDPAU objects, create different surfaces etc.
  */
-static int reconfig(struct vo *vo, struct mp_image_params *params, int flags)
+static int reconfig(struct vo *vo, struct mp_image_params *params)
 {
     struct vdpctx *vc = vo->priv;
     struct vdp_functions *vdp = vc->vdp;
@@ -450,7 +525,7 @@ static int reconfig(struct vo *vo, struct mp_image_params *params, int flags)
 
     free_video_specific(vo);
 
-    vo_x11_config_vo_window(vo, NULL, flags, "vdpau");
+    vo_x11_config_vo_window(vo);
 
     if (initialize_vdpau_objects(vo) < 0)
         return -1;
@@ -576,13 +651,15 @@ static void generate_osd_part(struct vo *vo, struct sub_bitmaps *imgs)
         CHECK_VDP_WARNING(vo, "OSD: error when creating surface");
     }
     if (imgs->scaled) {
-        char zeros[sfc->packer->used_width * format_size];
-        memset(zeros, 0, sizeof(zeros));
+        char *zeros = calloc(sfc->packer->used_width, format_size);
+        if (!zeros)
+            return;
         vdp_st = vdp->bitmap_surface_put_bits_native(sfc->surface,
                 &(const void *){zeros}, &(uint32_t){0},
                 &(VdpRect){0, 0, sfc->packer->used_width,
                                  sfc->packer->used_height});
         CHECK_VDP_WARNING(vo, "OSD: error uploading OSD bitmap");
+        free(zeros);
     }
 
     if (sfc->surface == VDP_INVALID_HANDLE)
@@ -637,8 +714,8 @@ static void draw_osd(struct vo *vo)
     if (!status_ok(vo))
         return;
 
-    static const bool formats[SUBBITMAP_COUNT] = {
-        [SUBBITMAP_LIBASS] = true,
+    bool formats[SUBBITMAP_COUNT] = {
+        [SUBBITMAP_LIBASS] = vc->supports_a8,
         [SUBBITMAP_RGBA] = true,
     };
 
@@ -701,16 +778,19 @@ static inline uint64_t prev_vsync(struct vdpctx *vc, uint64_t ts)
     return ts - offset;
 }
 
-static int flip_page_timed(struct vo *vo, int64_t pts_us, int duration)
+static void flip_page(struct vo *vo)
 {
     struct vdpctx *vc = vo->priv;
     struct vdp_functions *vdp = vc->vdp;
     VdpStatus vdp_st;
 
+    int64_t pts_us = vc->current_pts;
+    int duration = vc->current_duration;
+
     vc->dropped_frame = true; // changed at end if false
 
     if (!check_preemption(vo))
-        return 0;
+        goto drop;
 
     vc->vsync_interval = 1;
     if (vc->user_fps > 0) {
@@ -718,6 +798,7 @@ static int flip_page_timed(struct vo *vo, int64_t pts_us, int duration)
     } else if (vc->user_fps == 0) {
         vc->vsync_interval = vo_get_vsync_interval(vo) * 1000;
     }
+    vc->vsync_interval = MPMAX(vc->vsync_interval, 1);
 
     if (duration > INT_MAX / 1000)
         duration = -1;
@@ -795,7 +876,7 @@ static int flip_page_timed(struct vo *vo, int64_t pts_us, int duration)
     pts = FFMAX(pts, vc->last_queue_time + vc->vsync_interval);
     pts = FFMAX(pts, now);
     if (npts < PREV_VSYNC(pts) + vc->vsync_interval)
-        return 0;
+        goto drop;
 
     int num_flips = update_presentation_queue_status(vo);
     vsync = vc->recent_vsync_time + num_flips * vc->vsync_interval;
@@ -803,7 +884,7 @@ static int flip_page_timed(struct vo *vo, int64_t pts_us, int duration)
     pts = FFMAX(pts, vsync + (vc->vsync_interval >> 2));
     vsync = PREV_VSYNC(pts);
     if (npts < vsync + vc->vsync_interval)
-        return 0;
+        goto drop;
     pts = vsync + (vc->vsync_interval >> 2);
     VdpOutputSurface frame = vc->output_surfaces[vc->surface_num];
     vdp_st = vdp->presentation_queue_display(vc->flip_queue, frame,
@@ -818,22 +899,30 @@ static int flip_page_timed(struct vo *vo, int64_t pts_us, int duration)
     vc->last_ideal_time = ideal_pts;
     vc->dropped_frame = false;
     vc->surface_num = WRAP_ADD(vc->surface_num, 1, vc->num_output_surfaces);
-    return 1;
+    return;
+
+drop:
+    vo_increment_drop_count(vo, 1);
 }
 
-static void draw_image(struct vo *vo, struct mp_image *mpi)
+static void draw_frame(struct vo *vo, struct vo_frame *frame)
 {
     struct vdpctx *vc = vo->priv;
 
     check_preemption(vo);
 
-    struct mp_image *vdp_mpi = mp_vdpau_upload_video_surface(vc->mpvdp, mpi);
-    if (!vdp_mpi)
-        MP_ERR(vo, "Could not upload image.\n");
-    talloc_free(mpi);
+    if (frame->current && !frame->redraw) {
+        struct mp_image *vdp_mpi =
+            mp_vdpau_upload_video_surface(vc->mpvdp, frame->current);
+        if (!vdp_mpi)
+            MP_ERR(vo, "Could not upload image.\n");
 
-    talloc_free(vc->current_image);
-    vc->current_image = vdp_mpi;
+        talloc_free(vc->current_image);
+        vc->current_image = vdp_mpi;
+    }
+
+    vc->current_pts = frame->pts;
+    vc->current_duration = frame->duration;
 
     if (status_ok(vo))
         video_to_output_surface(vo);
@@ -861,10 +950,6 @@ static struct mp_image *read_output_surface(struct vo *vo,
     struct mp_image *image = mp_image_alloc(IMGFMT_BGR0, w, h);
     if (!image)
         return NULL;
-
-    image->params.colorspace = MP_CSP_RGB;
-    // hardcoded with conv. matrix
-    image->params.colorlevels = vo->params->outputlevels;
 
     void *dst_planes[] = { image->planes[0] };
     uint32_t dst_pitches[] = { image->stride[0] };
@@ -923,6 +1008,10 @@ static void destroy_vdpau_objects(struct vo *vo)
         vdp_st = vdp->output_surface_destroy(vc->output_surfaces[i]);
         CHECK_VDP_WARNING(vo, "Error when calling vdp_output_surface_destroy");
     }
+    if (vc->rotation_surface != VDP_INVALID_HANDLE) {
+        vdp_st = vdp->output_surface_destroy(vc->rotation_surface);
+        CHECK_VDP_WARNING(vo, "Error when calling vdp_output_surface_destroy");
+    }
 
     for (int i = 0; i < MAX_OSD_PARTS; i++) {
         struct osd_bitmap_surface *sfc = &vc->osd_surfaces[i];
@@ -954,7 +1043,12 @@ static int preinit(struct vo *vo)
     if (!vo_x11_init(vo))
         return -1;
 
-    vc->mpvdp = mp_vdpau_create_device_x11(vo->log, vo->x11->display);
+    if (!vo_x11_create_vo_window(vo, NULL, "vdpau")) {
+        vo_x11_uninit(vo);
+        return -1;
+    }
+
+    vc->mpvdp = mp_vdpau_create_device_x11(vo->log, vo->x11->display, false);
     if (!vc->mpvdp) {
         vo_x11_uninit(vo);
         return -1;
@@ -977,6 +1071,9 @@ static int preinit(struct vo *vo)
 
     vc->vdp_device = vc->mpvdp->vdp_device;
     vc->vdp = &vc->mpvdp->vdp;
+
+    vc->vdp->bitmap_surface_query_capabilities(vc->vdp_device, VDP_RGBA_FORMAT_A8,
+                            &vc->supports_a8, &(uint32_t){0}, &(uint32_t){0});
 
     vc->video_eq.capabilities = MP_CSP_EQ_CAPS_COLORMATRIX;
 
@@ -1040,10 +1137,6 @@ static int control(struct vo *vo, uint32_t request, void *data)
         struct voctrl_get_equalizer_args *args = data;
         return get_equalizer(vo, args->name, args->valueptr);
     }
-    case VOCTRL_REDRAW_FRAME:
-        if (status_ok(vo))
-            video_to_output_surface(vo);
-        return true;
     case VOCTRL_RESET:
         forget_frames(vo, true);
         return true;
@@ -1075,13 +1168,13 @@ static int control(struct vo *vo, uint32_t request, void *data)
 const struct vo_driver video_out_vdpau = {
     .description = "VDPAU with X11",
     .name = "vdpau",
-    .caps = VO_CAP_FRAMEDROP,
+    .caps = VO_CAP_FRAMEDROP | VO_CAP_ROTATE90,
     .preinit = preinit,
     .query_format = query_format,
     .reconfig = reconfig,
     .control = control,
-    .draw_image = draw_image,
-    .flip_page_timed = flip_page_timed,
+    .draw_frame = draw_frame,
+    .flip_page = flip_page,
     .uninit = uninit,
     .priv_size = sizeof(struct vdpctx),
     .options = (const struct m_option []){

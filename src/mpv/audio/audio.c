@@ -22,9 +22,10 @@
 
 #include <libavutil/buffer.h>
 #include <libavutil/frame.h>
+#include <libavutil/mem.h>
 #include <libavutil/version.h>
 
-#include "talloc.h"
+#include "mpv_talloc.h"
 #include "common/common.h"
 #include "fmt-conversion.h"
 #include "audio.h"
@@ -34,8 +35,8 @@ static void update_redundant_info(struct mp_audio *mpa)
     assert(mp_chmap_is_empty(&mpa->channels) ||
            mp_chmap_is_valid(&mpa->channels));
     mpa->nch = mpa->channels.num;
-    mpa->bps = af_fmt2bps(mpa->format);
-    if (AF_FORMAT_IS_PLANAR(mpa->format)) {
+    mpa->bps = af_fmt_to_bytes(mpa->format);
+    if (af_fmt_is_planar(mpa->format)) {
         mpa->spf = 1;
         mpa->num_planes = mpa->nch;
         mpa->sstride = mpa->bps;
@@ -55,13 +56,6 @@ void mp_audio_set_format(struct mp_audio *mpa, int format)
 void mp_audio_set_num_channels(struct mp_audio *mpa, int num_channels)
 {
     mp_chmap_from_channels(&mpa->channels, num_channels);
-    update_redundant_info(mpa);
-}
-
-// Use old MPlayer/ALSA channel layout.
-void mp_audio_set_channels_old(struct mp_audio *mpa, int num_channels)
-{
-    mp_chmap_from_channels_alsa(&mpa->channels, num_channels);
     update_redundant_info(mpa);
 }
 
@@ -93,15 +87,19 @@ bool mp_audio_config_valid(const struct mp_audio *mpa)
 
 char *mp_audio_config_to_str_buf(char *buf, size_t buf_sz, struct mp_audio *mpa)
 {
+    char ch[128];
+    mp_chmap_to_str_buf(ch, sizeof(ch), &mpa->channels);
+    char *hr_ch = mp_chmap_to_str_hr(&mpa->channels);
+    if (strcmp(hr_ch, ch) != 0)
+        mp_snprintf_cat(ch, sizeof(ch), " (%s)", hr_ch);
     snprintf(buf, buf_sz, "%dHz %s %dch %s", mpa->rate,
-             mp_chmap_to_str(&mpa->channels), mpa->channels.num,
-             af_fmt_to_str(mpa->format));
+             ch, mpa->channels.num, af_fmt_to_str(mpa->format));
     return buf;
 }
 
 void mp_audio_force_interleaved_format(struct mp_audio *mpa)
 {
-    if (AF_FORMAT_IS_PLANAR(mpa->format))
+    if (af_fmt_is_planar(mpa->format))
         mp_audio_set_format(mpa, af_fmt_from_planar(mpa->format));
 }
 
@@ -326,21 +324,23 @@ struct mp_audio *mp_audio_from_avframe(struct AVFrame *avframe)
     }
 
     // If we can't handle the format (e.g. too many channels), bail out.
-    if (!mp_audio_config_valid(new) || avframe->nb_extended_buf)
+    if (!mp_audio_config_valid(new))
         goto fail;
 
-    for (int n = 0; n < AV_NUM_DATA_POINTERS; n++) {
-        if (!avframe->buf[n])
+    for (int n = 0; n < AV_NUM_DATA_POINTERS + avframe->nb_extended_buf; n++) {
+        AVBufferRef *buf = n < AV_NUM_DATA_POINTERS ? avframe->buf[n]
+                            : avframe->extended_buf[n - AV_NUM_DATA_POINTERS];
+        if (!buf)
             break;
         if (n >= MP_NUM_CHANNELS)
             goto fail;
-        new->allocated[n] = av_buffer_ref(avframe->buf[n]);
+        new->allocated[n] = av_buffer_ref(buf);
         if (!new->allocated[n])
             goto fail;
     }
 
     for (int n = 0; n < new->num_planes; n++)
-        new->planes[n] = avframe->data[n];
+        new->planes[n] = avframe->extended_data[n];
     new->samples = avframe->nb_samples;
 
     return new;
@@ -348,6 +348,78 @@ struct mp_audio *mp_audio_from_avframe(struct AVFrame *avframe)
 fail:
     talloc_free(new);
     av_frame_free(&tmp);
+    return NULL;
+}
+
+// Returns NULL on failure. The input is always unreffed.
+struct AVFrame *mp_audio_to_avframe_and_unref(struct mp_audio *frame)
+{
+    struct AVFrame *avframe = av_frame_alloc();
+    if (!avframe)
+        goto fail;
+
+    avframe->nb_samples = frame->samples;
+    avframe->format = af_to_avformat(frame->format);
+    if (avframe->format == AV_SAMPLE_FMT_NONE)
+        goto fail;
+
+    avframe->channel_layout = mp_chmap_to_lavc(&frame->channels);
+    if (!avframe->channel_layout)
+        goto fail;
+#if LIBAVUTIL_VERSION_MICRO >= 100
+    // FFmpeg being a stupid POS (but I respect it)
+    avframe->channels = frame->channels.num;
+#endif
+    avframe->sample_rate = frame->rate;
+
+    if (frame->num_planes > AV_NUM_DATA_POINTERS) {
+        avframe->extended_data =
+            av_mallocz_array(frame->num_planes, sizeof(avframe->extended_data[0]));
+        int extbufs = frame->num_planes - AV_NUM_DATA_POINTERS;
+        avframe->extended_buf =
+            av_mallocz_array(extbufs, sizeof(avframe->extended_buf[0]));
+        if (!avframe->extended_data || !avframe->extended_buf)
+            goto fail;
+        avframe->nb_extended_buf = extbufs;
+    }
+
+    for (int p = 0; p < frame->num_planes; p++)
+        avframe->extended_data[p] = frame->planes[p];
+    avframe->linesize[0] = frame->samples * frame->sstride;
+
+    for (int p = 0; p < AV_NUM_DATA_POINTERS; p++)
+        avframe->data[p] = avframe->extended_data[p];
+
+    for (int p = 0; p < frame->num_planes; p++) {
+        if (!frame->allocated[p])
+            break;
+        AVBufferRef *nref = av_buffer_ref(frame->allocated[p]);
+        if (!nref)
+            goto fail;
+        if (p < AV_NUM_DATA_POINTERS) {
+            avframe->buf[p] = nref;
+        } else {
+            avframe->extended_buf[p - AV_NUM_DATA_POINTERS] = nref;
+        }
+    }
+
+    // Force refcounted frame.
+    if (!avframe->buf[0]) {
+        AVFrame *tmp = av_frame_alloc();
+        if (!tmp)
+            goto fail;
+        if (av_frame_ref(tmp, avframe) < 0)
+            goto fail;
+        av_frame_free(&avframe);
+        avframe = tmp;
+    }
+
+    talloc_free(frame);
+    return avframe;
+
+fail:
+    av_frame_free(&avframe);
+    talloc_free(frame);
     return NULL;
 }
 

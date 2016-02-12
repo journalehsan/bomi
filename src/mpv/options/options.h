@@ -19,6 +19,7 @@ typedef struct mp_vo_opts {
     int fs_black_out_screens;
     char *winname;
     int x11_netwm;
+    int x11_bypass_compositor;
     int native_keyrepeat;
 
     float panscan;
@@ -42,7 +43,12 @@ typedef struct mp_vo_opts {
     float monitor_pixel_aspect;
     int force_window_position;
 
+    char *mmcss_profile;
+
+    // vo_wayland, vo_drm
     struct sws_opts *sws_opts;
+    // vo_opengl, vo_opengl_cb
+    int hwdec_preload_api;
 } mp_vo_opts;
 
 struct mp_cache_opts {
@@ -50,6 +56,7 @@ struct mp_cache_opts {
     int def_size;
     int initial;
     int seek_min;
+    int back_buffer;
     char *file;
     int file_max;
 };
@@ -77,6 +84,7 @@ typedef struct MPOpts {
     struct m_obj_settings *audio_driver_list, *ao_defs;
     char *audio_device;
     char *audio_client_name;
+    int ao_null_fallback;
     int force_vo;
     int softvol;
     float mixer_init_volume;
@@ -99,6 +107,7 @@ typedef struct MPOpts {
     int gamma_contrast;
     int gamma_saturation;
     int gamma_hue;
+    int video_output_levels;
 
     int stop_screensaver;
     int cursor_autohide_delay;
@@ -138,8 +147,11 @@ typedef struct MPOpts {
     int chapterrange[2];
     int edition_id;
     int correct_pts;
-    int user_pts_assoc_mode;
     int initial_audio_sync;
+    int video_sync;
+    double sync_max_video_change;
+    double sync_max_audio_change;
+    double sync_audio_drop_size;
     int hr_seek;
     float hr_seek_demuxer_offset;
     int hr_seek_framedrop;
@@ -160,9 +172,11 @@ typedef struct MPOpts {
     float heartbeat_interval;
     int player_idle_mode;
     int consolecontrols;
+    int playlist_pos;
     struct m_rel_time play_start;
     struct m_rel_time play_end;
     struct m_rel_time play_length;
+    int rebase_start_time;
     int play_frames;
     double ab_loop[2];
     double step_sec;
@@ -172,6 +186,7 @@ typedef struct MPOpts {
     int ignore_path_in_watch_later_config;
     int pause;
     int keep_open;
+    char *lavfi_complex;
     int stream_id[2][STREAM_TYPE_COUNT];
     int stream_id_ff[STREAM_TYPE_COUNT];
     char **stream_lang[STREAM_TYPE_COUNT];
@@ -184,18 +199,20 @@ typedef struct MPOpts {
     float sub_speed;
     int forced_subs_only;
     int stretch_dvd_subs;
+    int stretch_image_subs;
 
     int sub_fix_timing;
     char *sub_cp;
 
     char **audio_files;
     char *demuxer_name;
+    int demuxer_max_packs;
+    int demuxer_max_bytes;
     int demuxer_thread;
-    int demuxer_min_packs;
-    int demuxer_min_bytes;
     double demuxer_min_secs;
     char *audio_demuxer_name;
     char *sub_demuxer_name;
+    int force_seekable;
 
     double demuxer_min_secs_cache;
     int cache_pausing;
@@ -209,6 +226,7 @@ typedef struct MPOpts {
 
     struct mp_chmap audio_output_channels;
     int audio_output_format;
+    int audio_normalize;
     int force_srate;
     int dtshd;
     double playback_speed;
@@ -217,12 +235,14 @@ typedef struct MPOpts {
     struct m_obj_settings *af_settings, *af_defs;
     int deinterlace;
     float movie_aspect;
+    int aspect_method;
     int field_dominance;
     char **sub_name;
     char **sub_paths;
+    char **audiofile_paths;
+    char **external_files;
     int sub_auto;
     int audiofile_auto;
-    int use_text_osd;
     int osd_bar_visible;
     float osd_bar_align_x;
     float osd_bar_align_y;
@@ -255,6 +275,7 @@ typedef struct MPOpts {
 
     int hwdec_api;
     char *hwdec_codecs;
+    int videotoolbox_format;
 
     int w32_priority;
 
@@ -265,6 +286,8 @@ typedef struct MPOpts {
     char **network_http_header_fields;
     int network_tls_verify;
     char *network_tls_ca_file;
+    char *network_tls_cert_file;
+    char *network_tls_key_file;
     double network_timeout;
 
     struct tv_params *tv_params;

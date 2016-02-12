@@ -49,11 +49,16 @@ static void aspect_calc_panscan(struct mp_log *log, struct mp_vo_opts *opts,
            fwidth, fheight, d_w, d_h);
 
     int vo_panscan_area = window_h - fheight;
-    if (!vo_panscan_area)
+    double f_w = fwidth / (double)fheight;
+    double f_h = 1;
+    if (!vo_panscan_area) {
         vo_panscan_area = window_w - fwidth;
+        f_w = 1;
+        f_h = fheight / (double)fwidth;
+    }
 
-    *out_w = fwidth + vo_panscan_area * opts->panscan * fwidth / fheight;
-    *out_h = fheight + vo_panscan_area * opts->panscan;
+    *out_w = fwidth + vo_panscan_area * opts->panscan * f_w;
+    *out_h = fheight + vo_panscan_area * opts->panscan * f_h;
 }
 
 // Clamp [start, end) to range [0, size) with various fallbacks.
@@ -130,8 +135,8 @@ void mp_get_src_dst_rects(struct mp_log *log, struct mp_vo_opts *opts,
 {
     int src_w = video->w;
     int src_h = video->h;
-    int src_dw = video->d_w;
-    int src_dh = video->d_h;
+    int src_dw, src_dh;
+    mp_image_params_get_dsize(video, &src_dw, &src_dh);
     if (video->rotate % 180 == 90 && (vo_caps & VO_CAP_ROTATE90)) {
         MPSWAP(int, src_w, src_h);
         MPSWAP(int, src_dw, src_dh);
@@ -169,8 +174,8 @@ void mp_get_src_dst_rects(struct mp_log *log, struct mp_vo_opts *opts,
 
     mp_verbose(log, "Window size: %dx%d\n",
                window_w, window_h);
-    mp_verbose(log, "Video source: %dx%d (%dx%d)\n",
-               video->w, video->h, video->d_w, video->d_h);
+    mp_verbose(log, "Video source: %dx%d (%d:%d)\n",
+               video->w, video->h, video->p_w, video->p_h);
     mp_verbose(log, "Video display: (%d, %d) %dx%d -> (%d, %d) %dx%d\n",
                src.x0, src.y0, sw, sh, dst.x0, dst.y0, dw, dh);
     mp_verbose(log, "Video scale: %f/%f\n",

@@ -1,18 +1,18 @@
 /*
  * This file is part of mpv.
  *
- * mpv is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
+ * mpv is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * mpv is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * GNU Lesser General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License along
- * with mpv.  If not, see <http://www.gnu.org/licenses/>.
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 #include <stdlib.h>
@@ -35,7 +35,7 @@ static bool check_mimetype(struct stream *s, const char *const *list)
 {
     if (s->mime_type) {
         for (int n = 0; list && list[n]; n++) {
-            if (strcmp(s->mime_type, list[n]) == 0)
+            if (strcasecmp(s->mime_type, list[n]) == 0)
                 return true;
         }
     }
@@ -54,6 +54,7 @@ struct pl_parser {
     bool add_base;
     enum demux_check check_level;
     struct stream *real_stream;
+    char *format;
 };
 
 static char *pl_get_line0(struct pl_parser *p)
@@ -112,11 +113,27 @@ static int parse_m3u(struct pl_parser *p)
 ok:
     if (p->probing)
         return 0;
+    char *title = NULL;
     while (line.len || !pl_eof(p)) {
-        if (line.len > 0 && !bstr_startswith0(line, "#"))
-            pl_add(p, line);
+        if (bstr_eatstart0(&line, "#EXTINF:")) {
+            bstr duration, btitle;
+            if (bstr_split_tok(line, ",", &duration, &btitle) && btitle.len) {
+                talloc_free(title);
+                title = bstrto0(NULL, btitle);
+            }
+        } else if (bstr_startswith0(line, "#EXT-X-")) {
+            p->format = "hls";
+        } else if (line.len > 0 && !bstr_startswith0(line, "#")) {
+            char *fn = bstrto0(NULL, line);
+            struct playlist_entry *e = playlist_entry_new(fn);
+            talloc_free(fn);
+            e->title = talloc_steal(e, title);
+            title = NULL;
+            playlist_add(p->pl, e);
+        }
         line = bstr_strip(pl_get_line(p));
     }
+    talloc_free(title);
     return 0;
 }
 
@@ -150,23 +167,6 @@ static int parse_ref_init(struct pl_parser *p)
         }
     }
     return 0;
-}
-
-static int parse_mov_rtsptext(struct pl_parser *p)
-{
-    bstr line = pl_get_line(p);
-    if (!bstr_eatstart(&line, bstr0("RTSPtext")))
-        return -1;
-    if (p->probing)
-        return 0;
-    line = bstr_strip(line);
-    do {
-        if (bstr_case_startswith(line, bstr0("rtsp://"))) {
-            pl_add(p, line);
-            return 0;
-        }
-    } while (!pl_eof(p) && (line = bstr_strip(pl_get_line(p))).len);
-    return -1;
 }
 
 static int parse_pls(struct pl_parser *p)
@@ -236,7 +236,7 @@ static int parse_dir(struct pl_parser *p)
 
     struct dirent *ep;
     while ((ep = readdir(dp))) {
-        if (strcmp(ep->d_name, ".") == 0 || strcmp(ep->d_name, "..") == 0)
+        if (ep->d_name[0] == '.')
             continue;
         MP_TARRAY_APPEND(p, files, num_files, talloc_strdup(p, ep->d_name));
     }
@@ -268,7 +268,6 @@ static const struct pl_format formats[] = {
     {"m3u", parse_m3u,
      MIME_TYPES("audio/mpegurl", "audio/x-mpegurl", "application/x-mpegurl")},
     {"ini", parse_ref_init},
-    {"mov", parse_mov_rtsptext},
     {"pls", parse_pls,
      MIME_TYPES("audio/x-scpls")},
     {"txt", parse_txt},
@@ -324,7 +323,7 @@ static int open_file(struct demuxer *demuxer, enum demux_check check)
     if (p->add_base)
         playlist_add_base_path(p->pl, mp_dirname(demuxer->filename));
     demuxer->playlist = talloc_steal(demuxer, p->pl);
-    demuxer->filetype = fmt->name;
+    demuxer->filetype = p->format ? p->format : fmt->name;
     demuxer->fully_read = true;
     talloc_free(p);
     return ok ? 0 : -1;

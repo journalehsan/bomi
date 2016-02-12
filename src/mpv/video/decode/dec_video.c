@@ -15,19 +15,21 @@
  * with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include "config.h"
-#include "options/options.h"
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
 #include <assert.h>
 
+#include <libavutil/rational.h>
+
+#include "config.h"
+#include "options/options.h"
 #include "common/msg.h"
 
 #include "osdep/timer.h"
 
 #include "stream/stream.h"
+#include "demux/demux.h"
 #include "demux/packet.h"
 
 #include "common/codecs.h"
@@ -37,7 +39,6 @@
 
 #include "demux/stheader.h"
 #include "video/decode/vd.h"
-#include "video/filter/vf.h"
 
 #include "video/decode/dec_video.h"
 
@@ -55,20 +56,18 @@ const vd_functions_t * const mpcodecs_vd_drivers[] = {
     NULL
 };
 
-void video_reset_decoding(struct dec_video *d_video)
+void video_reset(struct dec_video *d_video)
 {
     video_vd_control(d_video, VDCTRL_RESET, NULL);
-    if (d_video->vfilter && d_video->vfilter->initialized == 1)
-        vf_seek_reset(d_video->vfilter);
-    mp_image_unrefp(&d_video->waiting_decoded_mpi);
-    d_video->num_buffered_pts = 0;
-    d_video->last_pts = MP_NOPTS_VALUE;
-    d_video->last_packet_pdts = MP_NOPTS_VALUE;
+    d_video->first_packet_pdts = MP_NOPTS_VALUE;
+    d_video->start_pts = MP_NOPTS_VALUE;
     d_video->decoded_pts = MP_NOPTS_VALUE;
     d_video->codec_pts = MP_NOPTS_VALUE;
     d_video->codec_dts = MP_NOPTS_VALUE;
-    d_video->sorted_pts = MP_NOPTS_VALUE;
-    d_video->unsorted_pts = MP_NOPTS_VALUE;
+    d_video->last_format = d_video->fixed_format = (struct mp_image_params){0};
+    d_video->dropped_frames = 0;
+    d_video->current_state = DATA_AGAIN;
+    mp_image_unrefp(&d_video->current_mpi);
 }
 
 int video_vd_control(struct dec_video *d_video, int cmd, void *arg)
@@ -79,49 +78,16 @@ int video_vd_control(struct dec_video *d_video, int cmd, void *arg)
     return CONTROL_UNKNOWN;
 }
 
-int video_set_colors(struct dec_video *d_video, const char *item, int value)
-{
-    vf_equalizer_t data;
-
-    data.item = item;
-    data.value = value;
-
-    MP_VERBOSE(d_video, "set video colors %s=%d \n", item, value);
-    if (d_video->vfilter) {
-        int ret = video_vf_vo_control(d_video, VFCTRL_SET_EQUALIZER, &data);
-        if (ret == CONTROL_TRUE)
-            return 1;
-    }
-    MP_VERBOSE(d_video, "Video attribute '%s' is not supported by selected vo.\n",
-               item);
-    return 0;
-}
-
-int video_get_colors(struct dec_video *d_video, const char *item, int *value)
-{
-    vf_equalizer_t data;
-
-    data.item = item;
-
-    MP_VERBOSE(d_video, "get video colors %s \n", item);
-    if (d_video->vfilter) {
-        int ret = video_vf_vo_control(d_video, VFCTRL_GET_EQUALIZER, &data);
-        if (ret == CONTROL_TRUE) {
-            *value = data.value;
-            return 1;
-        }
-    }
-    return 0;
-}
-
 void video_uninit(struct dec_video *d_video)
 {
-    mp_image_unrefp(&d_video->waiting_decoded_mpi);
+    if (!d_video)
+        return;
+    mp_image_unrefp(&d_video->current_mpi);
+    mp_image_unrefp(&d_video->cover_art_mpi);
     if (d_video->vd_driver) {
         MP_VERBOSE(d_video, "Uninit video.\n");
         d_video->vd_driver->uninit(d_video);
     }
-    vf_destroy(d_video->vfilter);
     talloc_free(d_video);
 }
 
@@ -163,12 +129,12 @@ static const struct vd_functions *find_driver(const char *name)
 bool video_init_best_codec(struct dec_video *d_video, char* video_decoders)
 {
     assert(!d_video->vd_driver);
-    video_reset_decoding(d_video);
+    video_reset(d_video);
     d_video->has_broken_packet_pts = -10; // needs 10 packets to reach decision
 
     struct mp_decoder_entry *decoder = NULL;
     struct mp_decoder_list *list =
-        mp_select_video_decoders(d_video->header->codec, video_decoders);
+        mp_select_video_decoders(d_video->header->codec->codec, video_decoders);
 
     mp_print_decoders(d_video->log, MSGL_V, "Codec list:", list);
 
@@ -196,7 +162,7 @@ bool video_init_best_codec(struct dec_video *d_video, char* video_decoders)
         MP_VERBOSE(d_video, "Selected video codec: %s\n", d_video->decoder_desc);
     } else {
         MP_ERR(d_video, "Failed to initialize a video decoder for codec '%s'.\n",
-               d_video->header->codec ? d_video->header->codec : "<unknown>");
+               d_video->header->codec->codec);
     }
 
     if (d_video->header->missing_timestamps) {
@@ -209,93 +175,74 @@ bool video_init_best_codec(struct dec_video *d_video, char* video_decoders)
     return !!d_video->vd_driver;
 }
 
-static void add_pts_to_sort(struct dec_video *d_video, double pts)
-{
-    if (pts != MP_NOPTS_VALUE) {
-        int delay = -1;
-        video_vd_control(d_video, VDCTRL_QUERY_UNSEEN_FRAMES, &delay);
-        if (delay >= 0 && delay < d_video->num_buffered_pts)
-            d_video->num_buffered_pts = delay;
-        if (d_video->num_buffered_pts ==
-            sizeof(d_video->buffered_pts) / sizeof(double))
-            MP_ERR(d_video, "Too many buffered pts\n");
-        else {
-            int i, j;
-            for (i = 0; i < d_video->num_buffered_pts; i++)
-                if (d_video->buffered_pts[i] < pts)
-                    break;
-            for (j = d_video->num_buffered_pts; j > i; j--)
-                d_video->buffered_pts[j] = d_video->buffered_pts[j - 1];
-            d_video->buffered_pts[i] = pts;
-            d_video->num_buffered_pts++;
-        }
-    }
-}
-
-// Return true if pts1 comes before pts2. pts1 can be MP_NOPTS_VALUE, but pts2
-// always has to be valid. pts1 can't be equal or larger than pts2.
-#define PTS_IS_ORDERED(pts1, pts2) \
-    ((pts2) != MP_NOPTS_VALUE && ((pts1) == MP_NOPTS_VALUE || ((pts1) < (pts2))))
-
-static double retrieve_sorted_pts(struct dec_video *d_video, double codec_pts)
+static void fix_image_params(struct dec_video *d_video,
+                             struct mp_image_params *params)
 {
     struct MPOpts *opts = d_video->opts;
+    struct mp_image_params p = *params;
+    struct mp_codec_params *c = d_video->header->codec;
 
-    double sorted_pts;
-    if (d_video->num_buffered_pts) {
-        d_video->num_buffered_pts--;
-        sorted_pts = d_video->buffered_pts[d_video->num_buffered_pts];
-    } else {
-        MP_ERR(d_video, "No pts value from demuxer to use for frame!\n");
-        sorted_pts = MP_NOPTS_VALUE;
+    MP_VERBOSE(d_video, "Decoder format: %s\n", mp_image_params_to_str(params));
+
+    // While mp_image_params normally always have to have d_w/d_h set, the
+    // decoder signals unknown bitstream aspect ratio with both set to 0.
+    float dec_aspect = p.p_w > 0 && p.p_h > 0 ? p.p_w / (float)p.p_h : 0;
+    if (d_video->initial_decoder_aspect == 0)
+        d_video->initial_decoder_aspect = dec_aspect;
+
+    bool use_container = true;
+    switch (opts->aspect_method) {
+    case 0:
+        // We normally prefer the container aspect, unless the decoder aspect
+        // changes at least once.
+        if (dec_aspect > 0 && d_video->initial_decoder_aspect != dec_aspect) {
+            MP_VERBOSE(d_video, "Using bitstream aspect ratio.\n");
+            // Even if the aspect switches back, don't use container aspect again.
+            d_video->initial_decoder_aspect = -1;
+            use_container = false;
+        }
+        break;
+    case 1:
+        use_container = false;
+        break;
     }
 
-    if (!PTS_IS_ORDERED(d_video->sorted_pts, sorted_pts))
-        d_video->num_sorted_pts_problems++;
-    d_video->sorted_pts = sorted_pts;
+    if (use_container && c->par_w > 0 && c->par_h) {
+        MP_VERBOSE(d_video, "Using container aspect ratio.\n");
+        p.p_w = c->par_w;
+        p.p_h = c->par_h;
+    }
 
-    if (!PTS_IS_ORDERED(d_video->unsorted_pts, codec_pts))
-        d_video->num_unsorted_pts_problems++;
-    d_video->unsorted_pts = codec_pts;
-
-    if (d_video->header->video->avi_dts) {
-        // Actually, they don't need to be sorted, we just reuse the buffering.
-        d_video->pts_assoc_mode = 2;
-    } else if (opts->user_pts_assoc_mode) {
-        d_video->pts_assoc_mode = opts->user_pts_assoc_mode;
-    } else if (d_video->pts_assoc_mode == 0) {
-        if (codec_pts != MP_NOPTS_VALUE)
-            d_video->pts_assoc_mode = 1;
-        else
-            d_video->pts_assoc_mode = 2;
-    } else {
-        int probcount1 = d_video->num_unsorted_pts_problems;
-        int probcount2 = d_video->num_sorted_pts_problems;
-        if (d_video->pts_assoc_mode == 2) {
-            int tmp = probcount1;
-            probcount1 = probcount2;
-            probcount2 = tmp;
-        }
-        if (probcount1 >= probcount2 * 1.5 + 2) {
-            d_video->pts_assoc_mode = 3 - d_video->pts_assoc_mode;
-            MP_WARN(d_video, "Switching to pts association mode %d.\n",
-                    d_video->pts_assoc_mode);
+    if (opts->movie_aspect >= 0) {
+        MP_VERBOSE(d_video, "Forcing user-set aspect ratio.\n");
+        if (opts->movie_aspect == 0) {
+            p.p_w = p.p_h = 1;
+        } else {
+            AVRational a = av_d2q(opts->movie_aspect, INT_MAX);
+            mp_image_params_set_dsize(&p, a.num, a.den);
         }
     }
-    return d_video->pts_assoc_mode == 1 ? codec_pts : sorted_pts;
+
+    // Assume square pixels if no aspect ratio is set at all.
+    if (p.p_w <= 0 || p.p_h <= 0)
+        p.p_w = p.p_h = 1;
+
+    // Detect colorspace from resolution.
+    mp_image_params_guess_csp(&p);
+
+    d_video->last_format = *params;
+    d_video->fixed_format = p;
 }
 
-struct mp_image *video_decode(struct dec_video *d_video,
-                              struct demux_packet *packet,
-                              int drop_frame)
+static struct mp_image *decode_packet(struct dec_video *d_video,
+                                      struct demux_packet *packet,
+                                      int drop_frame)
 {
     struct MPOpts *opts = d_video->opts;
-    bool sort_pts =
-        (opts->user_pts_assoc_mode != 1 || d_video->header->video->avi_dts)
-        && opts->correct_pts;
+    bool avi_pts = d_video->header->codec->avi_dts && opts->correct_pts;
 
     struct demux_packet packet_copy;
-    if (packet && packet->dts == MP_NOPTS_VALUE) {
+    if (packet && packet->dts == MP_NOPTS_VALUE && !avi_pts) {
         packet_copy = *packet;
         packet = &packet_copy;
         packet->dts = packet->pts;
@@ -305,14 +252,8 @@ struct mp_image *video_decode(struct dec_video *d_video,
     double pkt_dts = packet ? packet->dts : MP_NOPTS_VALUE;
 
     double pkt_pdts = pkt_pts == MP_NOPTS_VALUE ? pkt_dts : pkt_pts;
-    if (pkt_pdts != MP_NOPTS_VALUE)
-        d_video->last_packet_pdts = pkt_pdts;
-
-    if (sort_pts)
-        add_pts_to_sort(d_video, pkt_pdts);
-
-    double prev_codec_pts = d_video->codec_pts;
-    double prev_codec_dts = d_video->codec_dts;
+    if (pkt_pdts != MP_NOPTS_VALUE && d_video->first_packet_pdts == MP_NOPTS_VALUE)
+        d_video->first_packet_pdts = pkt_pdts;
 
     MP_STATS(d_video, "start decode video");
 
@@ -320,30 +261,33 @@ struct mp_image *video_decode(struct dec_video *d_video,
 
     MP_STATS(d_video, "end decode video");
 
+    // Error, discarded frame, dropped frame, or initial codec delay.
     if (!mpi || drop_frame) {
         talloc_free(mpi);
-        return NULL;            // error / skipped frame
+        return NULL;
     }
 
-    if (opts->field_dominance == 0)
-        mpi->fields |= MP_IMGFIELD_TOP_FIRST;
-    else if (opts->field_dominance == 1)
+    if (opts->field_dominance == 0) {
+        mpi->fields |= MP_IMGFIELD_TOP_FIRST | MP_IMGFIELD_INTERLACED;
+    } else if (opts->field_dominance == 1) {
         mpi->fields &= ~MP_IMGFIELD_TOP_FIRST;
+        mpi->fields |= MP_IMGFIELD_INTERLACED;
+    }
 
     // Note: the PTS is reordered, but the DTS is not. Both should be monotonic.
-    double pts = d_video->codec_pts;
-    double dts = d_video->codec_dts;
+    double pts = mpi->pts;
+    double dts = mpi->dts;
 
-    if (pts == MP_NOPTS_VALUE) {
-        d_video->codec_pts = prev_codec_pts;
-    } else if (pts < prev_codec_pts) {
-        d_video->num_codec_pts_problems++;
+    if (pts != MP_NOPTS_VALUE) {
+        if (pts < d_video->codec_pts)
+            d_video->num_codec_pts_problems++;
+        d_video->codec_pts = mpi->pts;
     }
 
-    if (dts == MP_NOPTS_VALUE) {
-        d_video->codec_dts = prev_codec_dts;
-    } else if (dts <= prev_codec_dts) {
-        d_video->num_codec_dts_problems++;
+    if (dts != MP_NOPTS_VALUE) {
+        if (dts <= d_video->codec_dts)
+            d_video->num_codec_dts_problems++;
+        d_video->codec_dts = mpi->dts;
     }
 
     // If PTS is unset, or non-monotonic, fall back to DTS.
@@ -351,21 +295,18 @@ struct mp_image *video_decode(struct dec_video *d_video,
          pts == MP_NOPTS_VALUE) && dts != MP_NOPTS_VALUE)
         pts = dts;
 
-    // Alternative PTS determination methods
-    if (sort_pts)
-        pts = retrieve_sorted_pts(d_video, pts);
-
     if (!opts->correct_pts || pts == MP_NOPTS_VALUE) {
         if (opts->correct_pts && !d_video->header->missing_timestamps)
             MP_WARN(d_video, "No video PTS! Making something up.\n");
 
         double frame_time = 1.0f / (d_video->fps > 0 ? d_video->fps : 25);
-        double base = d_video->last_packet_pdts;
+        double base = d_video->first_packet_pdts;
         pts = d_video->decoded_pts;
-        if (pts == MP_NOPTS_VALUE)
+        if (pts == MP_NOPTS_VALUE) {
             pts = base == MP_NOPTS_VALUE ? 0 : base;
-
-        pts += frame_time;
+        } else {
+            pts += frame_time;
+        }
     }
 
     if (d_video->has_broken_packet_pts < 0)
@@ -373,80 +314,103 @@ struct mp_image *video_decode(struct dec_video *d_video,
     if (d_video->num_codec_pts_problems || pkt_pts == MP_NOPTS_VALUE)
         d_video->has_broken_packet_pts = 1;
 
+    if (!mp_image_params_equal(&d_video->last_format, &mpi->params))
+        fix_image_params(d_video, &mpi->params);
+
+    mpi->params = d_video->fixed_format;
+
     mpi->pts = pts;
     d_video->decoded_pts = pts;
+
+    // Compensate for incorrectly using mpeg-style DTS for avi timestamps.
+    if (avi_pts && mpi->pts != MP_NOPTS_VALUE && d_video->fps > 0) {
+        int delay = -1;
+        video_vd_control(d_video, VDCTRL_GET_BFRAMES, &delay);
+        mpi->pts -= MPMAX(delay, 0) / d_video->fps;
+    }
+
     return mpi;
 }
 
-int video_reconfig_filters(struct dec_video *d_video,
-                           const struct mp_image_params *params)
+void video_reset_aspect(struct dec_video *d_video)
 {
-    struct MPOpts *opts = d_video->opts;
-    struct mp_image_params p = *params;
-    struct sh_video *sh = d_video->header->video;
-
-    float decoder_aspect = p.d_w / (float)p.d_h;
-    if (d_video->initial_decoder_aspect == 0)
-        d_video->initial_decoder_aspect = decoder_aspect;
-
-    // We normally prefer the container aspect, unless the decoder aspect
-    // changes at least once.
-    if (d_video->initial_decoder_aspect == decoder_aspect) {
-        if (sh->aspect > 0)
-            vf_set_dar(&p.d_w, &p.d_h, p.w, p.h, sh->aspect);
-    } else {
-        MP_VERBOSE(d_video, "Using bitstream aspect ratio.\n");
-        // Even if the aspect switches back, don't use container aspect again.
-        d_video->initial_decoder_aspect = -1;
-    }
-
-    float force_aspect = opts->movie_aspect;
-    if (force_aspect >= 0.0)
-        vf_set_dar(&p.d_w, &p.d_h, p.w, p.h, force_aspect);
-
-    // Detect colorspace from resolution.
-    mp_image_params_guess_csp(&p);
-
-    if (vf_reconfig(d_video->vfilter, params, &p) < 0) {
-        MP_FATAL(d_video, "Cannot initialize video filters.\n");
-        return -1;
-    }
-
-    return 0;
+    d_video->last_format = (struct mp_image_params){0};
 }
 
-// Send a VCTRL, or if it doesn't work, translate it to a VOCTRL and try the VO.
-int video_vf_vo_control(struct dec_video *d_video, int vf_cmd, void *data)
+void video_set_framedrop(struct dec_video *d_video, bool enabled)
 {
-    if (d_video->vfilter && d_video->vfilter->initialized > 0) {
-        int r = vf_control_any(d_video->vfilter, vf_cmd, data);
-        if (r != CONTROL_UNKNOWN)
-            return r;
+    d_video->framedrop_enabled = enabled;
+}
+
+// Frames before the start timestamp can be dropped. (Used for hr-seek.)
+void video_set_start(struct dec_video *d_video, double start_pts)
+{
+    d_video->start_pts = start_pts;
+}
+
+void video_work(struct dec_video *d_video)
+{
+    if (d_video->current_mpi)
+        return;
+
+    if (d_video->header->attached_picture) {
+        if (d_video->current_state == DATA_AGAIN && !d_video->cover_art_mpi) {
+            d_video->cover_art_mpi =
+                decode_packet(d_video, d_video->header->attached_picture, 0);
+            // Might need flush.
+            if (!d_video->cover_art_mpi)
+                d_video->cover_art_mpi = decode_packet(d_video, NULL, 0);
+            d_video->current_state = DATA_OK;
+        }
+        if (d_video->current_state == DATA_OK)
+            d_video->current_mpi = mp_image_new_ref(d_video->cover_art_mpi);
+        // (DATA_OK is returned the first time, when current_mpi is sill set)
+        d_video->current_state = DATA_EOF;
+        return;
     }
 
-    switch (vf_cmd) {
-    case VFCTRL_GET_DEINTERLACE:
-        return vo_control(d_video->vo, VOCTRL_GET_DEINTERLACE, data) == VO_TRUE;
-    case VFCTRL_SET_DEINTERLACE:
-        return vo_control(d_video->vo, VOCTRL_SET_DEINTERLACE, data) == VO_TRUE;
-    case VFCTRL_SET_EQUALIZER: {
-        vf_equalizer_t *eq = data;
-        if (!d_video->vo->config_ok)
-            return CONTROL_FALSE;                       // vo not configured?
-        struct voctrl_set_equalizer_args param = {
-            eq->item, eq->value
-        };
-        return vo_control(d_video->vo, VOCTRL_SET_EQUALIZER, &param) == VO_TRUE;
+    struct demux_packet *pkt;
+    if (demux_read_packet_async(d_video->header, &pkt) == 0) {
+        d_video->current_state = DATA_WAIT;
+        return;
     }
-    case VFCTRL_GET_EQUALIZER: {
-        vf_equalizer_t *eq = data;
-        if (!d_video->vo->config_ok)
-            return CONTROL_FALSE;                       // vo not configured?
-        struct voctrl_get_equalizer_args param = {
-            eq->item, &eq->value
-        };
-        return vo_control(d_video->vo, VOCTRL_GET_EQUALIZER, &param) == VO_TRUE;
+
+    int framedrop_type = d_video->framedrop_enabled ? 1 : 0;
+    if (d_video->start_pts != MP_NOPTS_VALUE && pkt &&
+        pkt->pts < d_video->start_pts - .005 &&
+        !d_video->has_broken_packet_pts)
+    {
+        framedrop_type = 2;
     }
+    d_video->current_mpi = decode_packet(d_video, pkt, framedrop_type);
+    bool had_packet = !!pkt;
+    talloc_free(pkt);
+
+    d_video->current_state = DATA_OK;
+    if (!d_video->current_mpi) {
+        d_video->current_state = DATA_EOF;
+        if (had_packet) {
+            if (framedrop_type == 1)
+                d_video->dropped_frames += 1;
+            d_video->current_state = DATA_AGAIN;
+        }
     }
-    return CONTROL_UNKNOWN;
+}
+
+// Fetch an image decoded with video_work(). Returns one of:
+//  DATA_OK:    *out_mpi is set to a new image
+//  DATA_WAIT:  waiting for demuxer; will receive a wakeup signal
+//  DATA_EOF:   end of file, no more frames to be expected
+//  DATA_AGAIN: dropped frame or something similar
+int video_get_frame(struct dec_video *d_video, struct mp_image **out_mpi)
+{
+    *out_mpi = NULL;
+    if (d_video->current_mpi) {
+        *out_mpi = d_video->current_mpi;
+        d_video->current_mpi = NULL;
+        return DATA_OK;
+    }
+    if (d_video->current_state == DATA_OK)
+        return DATA_AGAIN;
+    return d_video->current_state;
 }

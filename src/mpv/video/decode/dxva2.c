@@ -27,16 +27,20 @@
 
 #include <d3d9.h>
 #include <dxva2api.h>
+#include <ks.h>
 
 #include <libavcodec/dxva2.h>
 
 #include "lavc.h"
 #include "common/common.h"
 #include "common/av_common.h"
+#include "osdep/windows_utils.h"
 #include "video/fmt-conversion.h"
 #include "video/mp_image_pool.h"
 #include "video/hwdec.h"
-#include "gpu_memcpy_sse4.h"
+#include "video/d3d.h"
+
+#define ADDTIONAL_SURFACES HWDEC_DELAY_QUEUE_COUNT
 
 // A minor evil.
 #ifndef FF_DXVA2_WORKAROUND_INTEL_CLEARVIDEO
@@ -57,37 +61,41 @@ DEFINE_GUID(DXVA2_ModeVC1_D,          0x1b81beA3, 0xa0c7,0x11d3,0xb9,0x84,0x00,0
 DEFINE_GUID(DXVA2_ModeVC1_D2010,      0x1b81beA4, 0xa0c7,0x11d3,0xb9,0x84,0x00,0xc0,0x4f,0x2e,0x73,0xc5);
 DEFINE_GUID(DXVA2_ModeHEVC_VLD_Main,  0x5b11d51b, 0x2f4c,0x4452,0xbc,0xc3,0x09,0xf2,0xa1,0x16,0x0c,0xc0);
 DEFINE_GUID(DXVA2_NoEncrypt,          0x1b81beD0, 0xa0c7,0x11d3,0xb9,0x84,0x00,0xc0,0x4f,0x2e,0x73,0xc5);
-DEFINE_GUID(GUID_NULL,                0x00000000, 0x0000,0x0000,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00);
 
 typedef IDirect3D9* WINAPI pDirect3DCreate9(UINT);
 typedef HRESULT WINAPI pCreateDeviceManager9(UINT *, IDirect3DDeviceManager9 **);
 
 typedef struct dxva2_mode {
   const GUID     *guid;
+  const char     *name;
   enum AVCodecID codec;
 } dxva2_mode;
 
+#define MODE(id) &MP_CONCAT(DXVA2_Mode, id), # id
+
 static const dxva2_mode dxva2_modes[] = {
     /* MPEG-2 */
-    { &DXVA2_ModeMPEG2_VLD,      AV_CODEC_ID_MPEG2VIDEO },
-    { &DXVA2_ModeMPEG2and1_VLD,  AV_CODEC_ID_MPEG2VIDEO },
+    { MODE(MPEG2_VLD),      AV_CODEC_ID_MPEG2VIDEO },
+    { MODE(MPEG2and1_VLD),  AV_CODEC_ID_MPEG2VIDEO },
 
     /* H.264 */
-    { &DXVA2_ModeH264_F,         AV_CODEC_ID_H264 },
-    { &DXVA2_ModeH264_E,         AV_CODEC_ID_H264 },
+    { MODE(H264_F),         AV_CODEC_ID_H264 },
+    { MODE(H264_E),         AV_CODEC_ID_H264 },
     /* Intel specific H.264 mode */
-    { &DXVADDI_Intel_ModeH264_E, AV_CODEC_ID_H264 },
+    { &DXVADDI_Intel_ModeH264_E, "Intel_ModeH264_E", AV_CODEC_ID_H264 },
 
     /* VC-1 / WMV3 */
-    { &DXVA2_ModeVC1_D2010,      AV_CODEC_ID_VC1  },
-    { &DXVA2_ModeVC1_D2010,      AV_CODEC_ID_WMV3 },
-    { &DXVA2_ModeVC1_D,          AV_CODEC_ID_VC1  },
-    { &DXVA2_ModeVC1_D,          AV_CODEC_ID_WMV3 },
+    { MODE(VC1_D2010),      AV_CODEC_ID_VC1  },
+    { MODE(VC1_D2010),      AV_CODEC_ID_WMV3 },
+    { MODE(VC1_D),          AV_CODEC_ID_VC1  },
+    { MODE(VC1_D),          AV_CODEC_ID_WMV3 },
 
-    { &DXVA2_ModeHEVC_VLD_Main,  AV_CODEC_ID_HEVC },
+    { MODE(HEVC_VLD_Main),  AV_CODEC_ID_HEVC },
 
-    { NULL,                      0 },
+    { NULL,                 0 },
 };
+
+#undef MODE
 
 typedef struct surface_info {
     int used;
@@ -96,9 +104,6 @@ typedef struct surface_info {
 
 typedef struct DXVA2Context {
     struct mp_log *log;
-
-    void (*copy_nv12)(struct mp_image *dest, uint8_t *src_bits,
-                      unsigned src_pitch, unsigned surf_height);
 
     HMODULE d3dlib;
     HMODULE dxva2lib;
@@ -204,13 +209,10 @@ static void dxva2_release_img(void *ptr)
     av_free(w);
 }
 
-static struct mp_image *dxva2_allocate_image(struct lavc_ctx *s, int fmt,
+static struct mp_image *dxva2_allocate_image(struct lavc_ctx *s,
                                              int img_w, int img_h)
 {
     DXVA2Context *ctx = s->hwdec_priv;
-
-    if (fmt != IMGFMT_DXVA2)
-        return NULL;
 
     int i, old_unused = -1;
     for (i = 0; i < ctx->num_surfaces; i++) {
@@ -245,8 +247,8 @@ static struct mp_image *dxva2_allocate_image(struct lavc_ctx *s, int fmt,
     return mp_image_new_custom_ref(&mpi, w, dxva2_release_img);
 }
 
-static void copy_nv12_fallback(struct mp_image *dest, uint8_t *src_bits,
-                               unsigned src_pitch, unsigned surf_height)
+static void copy_nv12(struct mp_image *dest, uint8_t *src_bits,
+                      unsigned src_pitch, unsigned surf_height)
 {
     struct mp_image buf = {0};
     mp_image_setfmt(&buf, IMGFMT_NV12);
@@ -256,48 +258,8 @@ static void copy_nv12_fallback(struct mp_image *dest, uint8_t *src_bits,
     buf.stride[0] = src_pitch;
     buf.planes[1] = src_bits + src_pitch * surf_height;
     buf.stride[1] = src_pitch;
-    mp_image_copy(dest, &buf);
+    mp_image_copy_gpu(dest, &buf);
 }
-
-#pragma GCC push_options
-#pragma GCC target("sse4.1")
-
-static void copy_nv12_gpu_sse4(struct mp_image *dest, uint8_t *src_bits,
-                               unsigned src_pitch, unsigned surf_height)
-{
-    const int lines = dest->h;
-    const int stride_y = dest->stride[0];
-    const int stride_uv = dest->stride[1];
-
-    // If the strides match, the image can be copied in one go
-    if (stride_y == src_pitch && stride_uv == src_pitch) {
-        const size_t size = lines * src_pitch;
-        gpu_memcpy(dest->planes[0], src_bits, size);
-        gpu_memcpy(dest->planes[1], src_bits + src_pitch * surf_height, size / 2);
-
-    } else {
-        // Copy the Y plane line-by-line
-        uint8_t *dest_y = dest->planes[0];
-        const uint8_t *src_y = src_bits;
-        const int bytes_per_line = dest->w;
-        for (int i = 0; i < lines; i++) {
-            gpu_memcpy(dest_y, src_y, bytes_per_line);
-            dest_y += stride_y;
-            src_y += src_pitch;
-        }
-
-        // Copy the UV plane line-by-line
-        uint8_t *dest_uv = dest->planes[1];
-        const uint8_t *src_uv = src_bits + src_pitch * surf_height;
-        for (int i = 0; i < lines / 2; i++) {
-            gpu_memcpy(dest_uv, src_uv, bytes_per_line);
-            dest_uv += stride_uv;
-            src_uv += src_pitch;
-        }
-    }
-}
-
-#pragma GCC pop_options
 
 static struct mp_image *dxva2_retrieve_image(struct lavc_ctx *s,
                                              struct mp_image *img)
@@ -310,8 +272,11 @@ static struct mp_image *dxva2_retrieve_image(struct lavc_ctx *s,
 
     IDirect3DSurface9_GetDesc(surface, &surfaceDesc);
 
+    if (surfaceDesc.Width < img->w || surfaceDesc.Height < img->h)
+        return img;
+
     struct mp_image *sw_img =
-        mp_image_pool_get(ctx->sw_pool, IMGFMT_NV12, img->w, img->h);
+        mp_image_pool_get(ctx->sw_pool, IMGFMT_NV12, surfaceDesc.Width, surfaceDesc.Height);
 
     if (!sw_img)
         return img;
@@ -323,7 +288,8 @@ static struct mp_image *dxva2_retrieve_image(struct lavc_ctx *s,
         return img;
     }
 
-    ctx->copy_nv12(sw_img, LockedRect.pBits, LockedRect.Pitch, surfaceDesc.Height);
+    copy_nv12(sw_img, LockedRect.pBits, LockedRect.Pitch, surfaceDesc.Height);
+    mp_image_set_size(sw_img, img->w, img->h);
     mp_image_copy_attributes(sw_img, img);
 
     IDirect3DSurface9_UnlockRect(surface);
@@ -332,56 +298,33 @@ static struct mp_image *dxva2_retrieve_image(struct lavc_ctx *s,
     return sw_img;
 }
 
-static int dxva2_init(struct lavc_ctx *s)
+static int create_device(struct lavc_ctx *s)
 {
-    DXVA2Context *ctx;
+    DXVA2Context *ctx = s->hwdec_priv;
     pDirect3DCreate9      *createD3D = NULL;
-    pCreateDeviceManager9 *createDeviceManager = NULL;
     HRESULT hr;
     D3DPRESENT_PARAMETERS d3dpp = {0};
     D3DDISPLAYMODE        d3ddm;
-    unsigned resetToken = 0;
     UINT adapter = D3DADAPTER_DEFAULT;
 
-    ctx = talloc_zero(NULL, DXVA2Context);
-    if (!ctx)
-        return -1;
-    s->hwdec_priv = ctx;
-
-    ctx->log = mp_log_new(s, s->log, "dxva2");
-    ctx->sw_pool = talloc_steal(ctx, mp_image_pool_new(17));
-
-    if (av_get_cpu_flags() & AV_CPU_FLAG_SSE4) {
-        // Use a memcpy implementation optimised for copying from GPU memory
-        MP_DBG(ctx, "Using SSE4 memcpy\n");
-        ctx->copy_nv12 = copy_nv12_gpu_sse4;
-    } else {
-        // Use the CRT memcpy. This can be slower than software decoding.
-        MP_WARN(ctx, "Using fallback memcpy (slow)\n");
-        ctx->copy_nv12 = copy_nv12_fallback;
+    if (s->hwdec_info && s->hwdec_info->hwctx && s->hwdec_info->hwctx->d3d_ctx) {
+        ctx->d3d9device = s->hwdec_info->hwctx->d3d_ctx->d3d9_device;
+        if (ctx->d3d9device) {
+            IDirect3D9_AddRef(ctx->d3d9device);
+            MP_VERBOSE(ctx, "Using VO-supplied device %p.\n", ctx->d3d9device);
+            return 0;
+        }
     }
-
-    ctx->deviceHandle = INVALID_HANDLE_VALUE;
 
     ctx->d3dlib = LoadLibrary(L"d3d9.dll");
     if (!ctx->d3dlib) {
         MP_ERR(ctx, "Failed to load D3D9 library\n");
         goto fail;
     }
-    ctx->dxva2lib = LoadLibrary(L"dxva2.dll");
-    if (!ctx->dxva2lib) {
-        MP_ERR(ctx, "Failed to load DXVA2 library\n");
-        goto fail;
-    }
 
     createD3D = (pDirect3DCreate9 *)GetProcAddress(ctx->d3dlib, "Direct3DCreate9");
     if (!createD3D) {
         MP_ERR(ctx, "Failed to locate Direct3DCreate9\n");
-        goto fail;
-    }
-    createDeviceManager = (pCreateDeviceManager9 *)GetProcAddress(ctx->dxva2lib, "DXVA2CreateDirect3DDeviceManager9");
-    if (!createDeviceManager) {
-        MP_ERR(ctx, "Failed to locate DXVA2CreateDirect3DDeviceManager9\n");
         goto fail;
     }
 
@@ -405,6 +348,46 @@ static int dxva2_init(struct lavc_ctx *s)
                                  &d3dpp, &ctx->d3d9device);
     if (FAILED(hr)) {
         MP_ERR(ctx, "Failed to create Direct3D device\n");
+        goto fail;
+    }
+
+    return 0;
+
+fail:
+    return -1;
+}
+
+static int dxva2_init(struct lavc_ctx *s)
+{
+    DXVA2Context *ctx;
+    pCreateDeviceManager9 *createDeviceManager = NULL;
+    HRESULT hr;
+    unsigned resetToken = 0;
+
+    ctx = talloc_zero(NULL, DXVA2Context);
+    if (!ctx)
+        return -1;
+    s->hwdec_priv = ctx;
+
+    ctx->log = mp_log_new(s, s->log, "dxva2");
+    ctx->sw_pool = talloc_steal(ctx, mp_image_pool_new(17));
+
+    mp_check_gpu_memcpy(ctx->log, NULL);
+
+    ctx->deviceHandle = INVALID_HANDLE_VALUE;
+
+    ctx->dxva2lib = LoadLibrary(L"dxva2.dll");
+    if (!ctx->dxva2lib) {
+        MP_ERR(ctx, "Failed to load DXVA2 library\n");
+        goto fail;
+    }
+
+    if (create_device(s) < 0)
+        goto fail;
+
+    createDeviceManager = (pCreateDeviceManager9 *)GetProcAddress(ctx->dxva2lib, "DXVA2CreateDirect3DDeviceManager9");
+    if (!createDeviceManager) {
+        MP_ERR(ctx, "Failed to locate DXVA2CreateDirect3DDeviceManager9\n");
         goto fail;
     }
 
@@ -510,6 +493,30 @@ static int dxva2_create_decoder(struct lavc_ctx *s, int w, int h,
         goto fail;
     }
 
+    // dump all decoder info
+    MP_VERBOSE(ctx, "%d decoder devices:\n", (int)guid_count);
+    for (j = 0; j < guid_count; j++) {
+        GUID *guid = &guid_list[j];
+
+        const char *name = "<unknown>";
+        for (i = 0; dxva2_modes[i].guid; i++) {
+            if (IsEqualGUID(dxva2_modes[i].guid, guid))
+                name = dxva2_modes[i].name;
+        }
+
+        D3DFORMAT *target_list = NULL;
+        unsigned target_count = 0;
+        hr = IDirectXVideoDecoderService_GetDecoderRenderTargets(ctx->decoder_service, guid, &target_count, &target_list);
+        if (FAILED(hr))
+            continue;
+        char fmts[256] = {0};
+        for (i = 0; i < target_count; i++)
+            mp_snprintf_cat(fmts, sizeof(fmts), " %s", mp_tag_str(target_list[i]));
+        CoTaskMemFree(target_list);
+        MP_VERBOSE(ctx, "%s %s %s\n", mp_GUID_to_str(guid), name, fmts);
+    }
+
+    // find a suitable decoder
     for (i = 0; dxva2_modes[i].guid; i++) {
         D3DFORMAT *target_list = NULL;
         unsigned target_count = 0;
@@ -569,7 +576,7 @@ static int dxva2_create_decoder(struct lavc_ctx *s, int w, int h,
         surface_alignment = 16;
 
     /* 4 base work surfaces */
-    ctx->num_surfaces = 4;
+    ctx->num_surfaces = 4 + ADDTIONAL_SURFACES;
 
     /* add surfaces based on number of possible refs */
     if (codec_id == AV_CODEC_ID_H264 || codec_id == AV_CODEC_ID_HEVC)
@@ -622,7 +629,7 @@ fail:
     return -1;
 }
 
-static int dxva2_init_decoder(struct lavc_ctx *s, int fmt, int w, int h)
+static int dxva2_init_decoder(struct lavc_ctx *s, int w, int h)
 {
     DXVA2Context *ctx = s->hwdec_priv;
 
@@ -632,6 +639,10 @@ static int dxva2_init_decoder(struct lavc_ctx *s, int fmt, int w, int h)
         (profile & ~FF_PROFILE_H264_CONSTRAINED) > FF_PROFILE_H264_HIGH)
     {
         MP_ERR(ctx, "Unsupported H.264 profile for DXVA2 HWAccel: %d\n", profile);
+        return -1;
+    }
+    if (codec == AV_CODEC_ID_HEVC && profile != FF_PROFILE_HEVC_MAIN) {
+        MP_ERR(ctx, "Unsupported H.265 profile for DXVA2 HWAccel: %d\n", profile);
         return -1;
     }
 
@@ -649,6 +660,7 @@ static int dxva2_init_decoder(struct lavc_ctx *s, int fmt, int w, int h)
 static int probe(struct vd_lavc_hwdec *hwdec, struct mp_hwdec_info *info,
                  const char *decoder)
 {
+    hwdec_request_api(info, "dxva2"); // we can do without too
     for (int i = 0; dxva2_modes[i].guid; i++) {
         const dxva2_mode *mode = &dxva2_modes[i];
         if (mp_codec_to_av_codec_id(decoder) == mode->codec)

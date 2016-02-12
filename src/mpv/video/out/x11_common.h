@@ -52,6 +52,7 @@ struct vo_x11_state {
     int ws_width;
     int ws_height;
     struct mp_rect screenrc;
+    char *window_title;
 
     struct xrandr_display displays[MAX_DISPLAYS];
     int num_displays;
@@ -70,8 +71,6 @@ struct vo_x11_state {
     XIC xic;
     bool no_autorepeat;
 
-    GC f_gc;    // used to paint background
-    GC vo_gc;   // used to paint video
     Colormap colormap;
 
     int wm_type;
@@ -114,6 +113,7 @@ struct vo_x11_state {
 
     /* drag and drop */
     Atom dnd_requested_format;
+    Atom dnd_requested_action;
     Window dnd_src_window;
 
     /* dragging the window */
@@ -126,10 +126,11 @@ int vo_x11_init(struct vo *vo);
 void vo_x11_uninit(struct vo *vo);
 int vo_x11_check_events(struct vo *vo);
 bool vo_x11_screen_is_composited(struct vo *vo);
-void vo_x11_config_vo_window(struct vo *vo, XVisualInfo *vis, int flags,
+bool vo_x11_create_vo_window(struct vo *vo, XVisualInfo *vis,
                              const char *classname);
-void vo_x11_clear_background(struct vo *vo, const struct mp_rect *rc);
-void vo_x11_clearwindow(struct vo *vo, Window vo_window);
+void vo_x11_config_vo_window(struct vo *vo);
 int vo_x11_control(struct vo *vo, int *events, int request, void *arg);
+
+void vo_x11_silence_xlib(int dir);
 
 #endif /* MPLAYER_X11_COMMON_H */

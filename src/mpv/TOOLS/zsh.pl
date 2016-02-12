@@ -120,7 +120,7 @@ $profile_comp
     _tags files urls
     while _tags; do
       _requested files expl 'media file' _files -g \\
-        "*.(#i)(asf|asx|avi|flac|flv|m1v|m2p|m2v|m4v|mjpg|mka|mkv|mov|mp3|mp4|mpe|mpeg|mpg|ogg|ogm|ogv|qt|rm|ts|vob|wav|webm|wma|wmv)(-.)" && rc=0
+        "*.(#i)(asf|asx|avi|flac|flv|m1v|m2p|m2v|m4v|mjpg|mka|mkv|mov|mp3|mp4|mpe|mpeg|mpg|ogg|ogm|ogv|opus|qt|rm|ts|vob|wav|webm|wma|wmv)(-.)" && rc=0
       if _requested urls; then
         while _next_label urls expl URL; do
           _urls "\$expl[@]" && rc=0
@@ -141,7 +141,7 @@ sub parse_main_opts {
     my ($cmd, $regex) = @_;
 
     my @list;
-    my @lines = split /\n/, `"$mpv" --no-config $cmd`;
+    my @lines = call_mpv($cmd);
 
     foreach my $line (@lines) {
         my ($name, $desc) = ($line =~ /^$regex/) or next;
@@ -206,7 +206,7 @@ sub parse_opts {
     my ($cmd, $regex) = @_;
 
     my @list;
-    my @lines = split /\n/, `"$mpv" --no-config $cmd`;
+    my @lines = call_mpv($cmd);
 
     foreach my $line (@lines) {
         if ($line !~ /^$regex/) {
@@ -225,4 +225,15 @@ sub parse_opts {
     }
 
     return @list;
+}
+
+sub call_mpv {
+    my ($cmd) = @_;
+    my $output = `"$mpv" --no-config $cmd`;
+    if ($? == -1) {
+        die "Could not run mpv: $!";
+    } elsif ((my $exit_code = $? >> 8) != 0) {
+        die "mpv returned $exit_code with output:\n$output";
+    }
+    return split /\n/, $output;
 }

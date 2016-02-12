@@ -24,23 +24,26 @@
 #include <initguid.h>
 #include <ole2.h>
 #include <shobjidl.h>
+#include <avrt.h>
 
 #include "options/options.h"
 #include "input/keycodes.h"
 #include "input/input.h"
 #include "input/event.h"
+#include "stream/stream.h"
 #include "common/msg.h"
 #include "common/common.h"
 #include "vo.h"
 #include "win_state.h"
 #include "w32_common.h"
+#include "win32/displayconfig.h"
 #include "osdep/io.h"
 #include "osdep/threads.h"
 #include "osdep/w32_keyboard.h"
 #include "osdep/atomics.h"
 #include "misc/dispatch.h"
 #include "misc/rendezvous.h"
-#include "talloc.h"
+#include "mpv_talloc.h"
 
 static const wchar_t classname[] = L"mpv";
 
@@ -59,8 +62,9 @@ struct vo_w32_state {
     HWND window;
     HWND parent; // 0 normally, set in embedding mode
 
-    // Size and virtual position of the current screen.
-    struct mp_rect screenrc;
+    HMONITOR monitor; // Handle of the current screen
+    struct mp_rect screenrc; // Size and virtual position of the current screen
+    char *color_profile; // Path of the current screen's color profile
 
     // last non-fullscreen extends (updated only on fullscreen or on initialization)
     int prev_width;
@@ -89,8 +93,6 @@ struct vo_w32_state {
     bool disable_screensaver;
     bool cursor_visible;
     int event_flags;
-    int mon_cnt;
-    int mon_id;
 
     BOOL tracking;
     TRACKMOUSEEVENT trackEvent;
@@ -105,9 +107,14 @@ struct vo_w32_state {
     int high_surrogate;
 
     ITaskbarList2 *taskbar_list;
+    ITaskbarList3 *taskbar_list3;
+    UINT tbtnCreatedMsg;
+    bool tbtnCreated;
 
     // updates on move/resize/displaychange
     double display_fps;
+
+    HANDLE avrt_handle;
 };
 
 typedef struct tagDropTarget {
@@ -225,6 +232,8 @@ static HRESULT STDMETHODCALLTYPE DropTarget_Drop(IDropTarget* This,
         t->dataObj = NULL;
     }
 
+    enum mp_dnd_action action = (grfKeyState & MK_SHIFT) ? DND_APPEND : DND_REPLACE;
+
     pDataObj->lpVtbl->AddRef(pDataObj);
 
     if (pDataObj->lpVtbl->GetData(pDataObj, &fmtetc_file, &medium) == S_OK) {
@@ -253,7 +262,8 @@ static HRESULT STDMETHODCALLTYPE DropTarget_Drop(IDropTarget* This,
             }
 
             GlobalUnlock(medium.hGlobal);
-            mp_event_drop_files(t->w32->input_ctx, nrecvd_files, files);
+            mp_event_drop_files(t->w32->input_ctx, nrecvd_files, files,
+                                action);
 
             talloc_free(files);
         }
@@ -262,15 +272,17 @@ static HRESULT STDMETHODCALLTYPE DropTarget_Drop(IDropTarget* This,
     } else if (pDataObj->lpVtbl->GetData(pDataObj,
                                          &fmtetc_url, &medium) == S_OK) {
         // get the URL encoded in US-ASCII
-        char* url = (char*)GlobalLock(medium.hGlobal);
-        if (url != NULL) {
+        wchar_t* wurl = GlobalLock(medium.hGlobal);
+        if (wurl != NULL) {
+            char *url = mp_to_utf8(NULL, wurl);
             if (mp_event_drop_mime_data(t->w32->input_ctx, "text/uri-list",
-                                        bstr0(url)) > 0) {
+                                        bstr0(url), action) > 0) {
                 MP_VERBOSE(t->w32, "received dropped URL: %s\n", url);
             } else {
                 MP_ERR(t->w32, "error getting dropped URL\n");
             }
 
+            talloc_free(url);
             GlobalUnlock(medium.hGlobal);
         }
 
@@ -566,22 +578,17 @@ static void wakeup_gui_thread(void *ctx)
     PostMessage(w32->window, WM_USER, 0, 0);
 }
 
-static double vo_w32_get_display_fps(struct vo_w32_state *w32)
+static double get_refresh_rate_from_gdi(const wchar_t *device)
 {
-    // Get the device name of the monitor containing the window
-    HMONITOR mon = MonitorFromWindow(w32->window, MONITOR_DEFAULTTOPRIMARY);
-    MONITORINFOEXW mi = { .cbSize = sizeof mi };
-    GetMonitorInfoW(mon, (MONITORINFO*)&mi);
-
-    DEVMODE dm = { .dmSize = sizeof dm };
-    if (!EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm))
-        return -1;
+    DEVMODEW dm = { .dmSize = sizeof dm };
+    if (!EnumDisplaySettingsW(device, ENUM_CURRENT_SETTINGS, &dm))
+        return 0.0;
 
     // May return 0 or 1 which "represent the display hardware's default refresh rate"
     // https://msdn.microsoft.com/en-us/library/windows/desktop/dd183565%28v=vs.85%29.aspx
     // mpv validates this value with a threshold of 1, so don't return exactly 1
     if (dm.dmDisplayFrequency == 1)
-        return 0;
+        return 0.0;
 
     // dm.dmDisplayFrequency is an integer which is rounded down, so it's
     // highly likely that 23 represents 24/1.001, 59 represents 60/1.001, etc.
@@ -603,14 +610,69 @@ static double vo_w32_get_display_fps(struct vo_w32_state *w32)
     return rv;
 }
 
-static void update_display_fps(struct vo_w32_state *w32)
+static char *get_color_profile(void *ctx, const wchar_t *device)
 {
-    double fps = vo_w32_get_display_fps(w32);
-    if (fps != w32->display_fps) {
-        w32->display_fps = fps;
+    char *name = NULL;
+
+    HDC ic = CreateICW(device, NULL, NULL, NULL);
+    if (!ic)
+        goto done;
+    wchar_t wname[MAX_PATH + 1];
+    if (!GetICMProfileW(ic, &(DWORD){ MAX_PATH }, wname))
+        goto done;
+
+    name = mp_to_utf8(ctx, wname);
+done:
+    if (ic)
+        DeleteDC(ic);
+    return name;
+}
+
+static void update_display_info(struct vo_w32_state *w32)
+{
+    HMONITOR monitor = MonitorFromWindow(w32->window, MONITOR_DEFAULTTOPRIMARY);
+    if (w32->monitor == monitor)
+        return;
+    w32->monitor = monitor;
+
+    MONITORINFOEXW mi = { .cbSize = sizeof mi };
+    GetMonitorInfoW(monitor, (MONITORINFO*)&mi);
+
+    // Try to get the monitor refresh rate.
+    double freq = 0.0;
+
+    if (freq == 0.0)
+        freq = mp_w32_displayconfig_get_refresh_rate(mi.szDevice);
+    if (freq == 0.0)
+        freq = get_refresh_rate_from_gdi(mi.szDevice);
+
+    if (freq != w32->display_fps) {
+        MP_VERBOSE(w32, "display-fps: %f\n", freq);
+        if (freq == 0.0)
+            MP_WARN(w32, "Couldn't determine monitor refresh rate\n");
+        w32->display_fps = freq;
         signal_events(w32, VO_EVENT_WIN_STATE);
-        MP_VERBOSE(w32, "display-fps: %f\n", fps);
     }
+
+    char *color_profile = get_color_profile(w32, mi.szDevice);
+    if ((color_profile == NULL) != (w32->color_profile == NULL) ||
+        (color_profile && strcmp(color_profile, w32->color_profile)))
+    {
+        if (color_profile)
+            MP_VERBOSE(w32, "color-profile: %s\n", color_profile);
+        talloc_free(w32->color_profile);
+        w32->color_profile = color_profile;
+        color_profile = NULL;
+        signal_events(w32, VO_EVENT_ICC_PROFILE_CHANGED);
+    }
+
+    talloc_free(color_profile);
+}
+
+static void force_update_display_info(struct vo_w32_state *w32)
+{
+    w32->monitor = 0;
+    update_display_info(w32);
 }
 
 static LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
@@ -638,7 +700,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
         ClientToScreen(w32->window, &p);
         w32->window_x = p.x;
         w32->window_y = p.y;
-        update_display_fps(w32);  // if we moved between monitors
+        update_display_info(w32);  // if we moved between monitors
         MP_VERBOSE(w32, "move window: %d:%d\n", w32->window_x, w32->window_y);
         break;
     }
@@ -647,18 +709,19 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
         if (GetClientRect(w32->window, &r) && r.right > 0 && r.bottom > 0) {
             w32->dw = r.right;
             w32->dh = r.bottom;
-            update_display_fps(w32); // if we moved between monitors
             signal_events(w32, VO_EVENT_RESIZE);
             MP_VERBOSE(w32, "resize window: %d:%d\n", w32->dw, w32->dh);
         }
 
         // Window may have been minimized or restored
         signal_events(w32, VO_EVENT_WIN_STATE);
+
+        update_display_info(w32);
         break;
     }
     case WM_SIZING:
         if (w32->opts->keepaspect && w32->opts->keepaspect_window &&
-            !w32->opts->fullscreen && !w32->parent)
+            !w32->current_fs && !w32->parent)
         {
             RECT *rc = (RECT*)lParam;
             // get client area of the windows if it had the rect rc
@@ -701,7 +764,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
         break;
     case WM_NCHITTEST:
         // Provide sizing handles for borderless windows
-        if (!w32->opts->border && !w32->opts->fullscreen) {
+        if (!w32->opts->border && !w32->current_fs) {
             return borderless_nchittest(w32, GET_X_LPARAM(lParam),
                                         GET_Y_LPARAM(lParam));
         }
@@ -798,8 +861,13 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
         mouse_button |= MP_KEY_STATE_UP;
         break;
     case WM_DISPLAYCHANGE:
-        update_display_fps(w32);
+        force_update_display_info(w32);
         break;
+    }
+
+    if (message == w32->tbtnCreatedMsg) {
+        w32->tbtnCreated = true;
+        return 0;
     }
 
     if (mouse_button) {
@@ -811,7 +879,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
             int y = GET_Y_LPARAM(lParam);
 
             if (mouse_button == (MP_MOUSE_BTN0 | MP_KEY_STATE_DOWN) &&
-                !w32->opts->fullscreen &&
+                !w32->current_fs &&
                 !mp_input_test_dragging(w32->input_ctx, x, y))
             {
                 // Window dragging hack
@@ -832,21 +900,12 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
     return DefWindowProcW(hWnd, message, wParam, lParam);
 }
 
-static bool is_key_message(UINT msg)
-{
-    return msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN ||
-           msg == WM_KEYUP || msg == WM_SYSKEYUP;
-}
-
 // Dispatch incoming window events and handle them.
 // This returns only when the thread is asked to terminate.
 static void run_message_loop(struct vo_w32_state *w32)
 {
     MSG msg;
     while (GetMessageW(&msg, 0, 0, 0) > 0) {
-        // Only send IME messages to TranslateMessage
-        if (is_key_message(msg.message) && msg.wParam == VK_PROCESSKEY)
-            TranslateMessage(&msg);
         DispatchMessageW(&msg);
 
         if (w32->parent) {
@@ -868,95 +927,97 @@ static void run_message_loop(struct vo_w32_state *w32)
         mp_dispatch_queue_process(w32->dispatch, 1000);
 }
 
-static BOOL CALLBACK mon_enum(HMONITOR hmon, HDC hdc, LPRECT r, LPARAM p)
+struct get_monitor_data {
+    int i;
+    int target;
+    HMONITOR mon;
+};
+
+static BOOL CALLBACK get_monitor_proc(HMONITOR mon, HDC dc, LPRECT r, LPARAM p)
 {
-    struct vo_w32_state *w32 = (void *)p;
-    // this defaults to the last screen if specified number does not exist
-    w32->screenrc = (struct mp_rect){r->left, r->top, r->right, r->bottom};
+    struct get_monitor_data *data = (struct get_monitor_data*)p;
 
-    if (w32->mon_cnt == w32->mon_id)
+    if (data->i == data->target) {
+        data->mon = mon;
         return FALSE;
-
-    w32->mon_cnt++;
+    }
+    data->i++;
     return TRUE;
 }
 
-static void w32_update_xinerama_info(struct vo_w32_state *w32)
+static HMONITOR get_monitor(int id)
+{
+    struct get_monitor_data data = { .target = id };
+    EnumDisplayMonitors(NULL, NULL, get_monitor_proc, (LPARAM)&data);
+    return data.mon;
+}
+
+static void update_screen_rect(struct vo_w32_state *w32)
 {
     struct mp_vo_opts *opts = w32->opts;
-    int screen = opts->fullscreen ? opts->fsscreen_id : opts->screen_id;
+    int screen = w32->current_fs ? opts->fsscreen_id : opts->screen_id;
 
-    if (opts->fullscreen && screen == -2) {
+    // Handle --fs-screen=all
+    if (w32->current_fs && screen == -2) {
         struct mp_rect rc = {
             GetSystemMetrics(SM_XVIRTUALSCREEN),
             GetSystemMetrics(SM_YVIRTUALSCREEN),
             GetSystemMetrics(SM_CXVIRTUALSCREEN),
             GetSystemMetrics(SM_CYVIRTUALSCREEN),
         };
-        if (!rc.x1 || !rc.y1) {
-            rc.x0 = rc.y0 = 0;
-            rc.x1 = w32->screenrc.x1;
-            rc.y1 = w32->screenrc.y1;
-        }
         rc.x1 += rc.x0;
         rc.y1 += rc.y0;
         w32->screenrc = rc;
-    } else if (screen == -1) {
-        MONITORINFO mi;
-        HMONITOR m = MonitorFromWindow(w32->window, MONITOR_DEFAULTTOPRIMARY);
-        mi.cbSize = sizeof(mi);
-        GetMonitorInfoW(m, &mi);
-        w32->screenrc = (struct mp_rect){
-            mi.rcMonitor.left, mi.rcMonitor.top,
-            mi.rcMonitor.right, mi.rcMonitor.bottom,
-        };
-    } else if (screen >= 0) {
-        w32->mon_cnt = 0;
-        w32->mon_id = screen;
-        EnumDisplayMonitors(NULL, NULL, mon_enum, (LONG_PTR)w32);
-    }
-}
-
-static void updateScreenProperties(struct vo_w32_state *w32)
-{
-    DEVMODE dm;
-    dm.dmSize = sizeof dm;
-    dm.dmDriverExtra = 0;
-    dm.dmFields = DM_BITSPERPEL | DM_PELSWIDTH | DM_PELSHEIGHT;
-
-    if (!EnumDisplaySettings(0, ENUM_CURRENT_SETTINGS, &dm)) {
-        MP_ERR(w32, "unable to enumerate display settings!\n");
         return;
     }
 
-    w32->screenrc = (struct mp_rect){0, 0, dm.dmPelsWidth, dm.dmPelsHeight};
-    w32_update_xinerama_info(w32);
+    // When not using --fs-screen=all, mpv belongs to a specific HMONITOR
+    HMONITOR mon;
+    if (screen == -1) {
+        // Handle --fs-screen=current and --screen=default
+        mon = MonitorFromWindow(w32->window, MONITOR_DEFAULTTOPRIMARY);
+    } else {
+        mon = get_monitor(screen);
+        if (!mon) {
+            MP_INFO(w32, "Screen %d does not exist, falling back to primary\n",
+                    screen);
+            mon = MonitorFromPoint((POINT){0, 0}, MONITOR_DEFAULTTOPRIMARY);
+        }
+    }
+
+    MONITORINFO mi = { .cbSize = sizeof(mi) };
+    GetMonitorInfoW(mon, &mi);
+    w32->screenrc = (struct mp_rect){
+        mi.rcMonitor.left, mi.rcMonitor.top,
+        mi.rcMonitor.right, mi.rcMonitor.bottom,
+    };
 }
 
 static DWORD update_style(struct vo_w32_state *w32, DWORD style)
 {
-    const DWORD NO_FRAME = WS_POPUP;
+    const DWORD NO_FRAME = WS_OVERLAPPED;
     const DWORD FRAME = WS_OVERLAPPEDWINDOW | WS_SIZEBOX;
     style &= ~(NO_FRAME | FRAME);
-    style |= (w32->opts->border && !w32->opts->fullscreen) ? FRAME : NO_FRAME;
+    style |= (w32->opts->border && !w32->current_fs) ? FRAME : NO_FRAME;
     return style;
 }
 
 // Update the window title, position, size, and border style.
-static int reinit_window_state(struct vo_w32_state *w32)
+static void reinit_window_state(struct vo_w32_state *w32)
 {
     HWND layer = HWND_NOTOPMOST;
     RECT r;
 
     if (w32->parent)
-        return 1;
+        return;
 
-    bool toggle_fs = w32->current_fs != w32->opts->fullscreen;
-    w32->current_fs = w32->opts->fullscreen;
+    bool new_fs = w32->opts->fullscreen;
+    bool toggle_fs = w32->current_fs != new_fs;
+    w32->current_fs = new_fs;
 
     if (w32->taskbar_list) {
         ITaskbarList2_MarkFullscreenWindow(w32->taskbar_list,
-                                           w32->window, w32->opts->fullscreen);
+                                           w32->window, w32->current_fs);
     }
 
     DWORD style = update_style(w32, GetWindowLong(w32->window, GWL_STYLE));
@@ -965,12 +1026,12 @@ static int reinit_window_state(struct vo_w32_state *w32)
         layer = HWND_TOPMOST;
 
     // xxx not sure if this can trigger any unwanted messages (WM_MOVE/WM_SIZE)
-    updateScreenProperties(w32);
+    update_screen_rect(w32);
 
     int screen_w = w32->screenrc.x1 - w32->screenrc.x0;
     int screen_h = w32->screenrc.y1 - w32->screenrc.y0;
 
-    if (w32->opts->fullscreen) {
+    if (w32->current_fs) {
         // Save window position and size when switching to fullscreen.
         if (toggle_fs) {
             w32->prev_width = w32->dw;
@@ -1007,7 +1068,7 @@ static int reinit_window_state(struct vo_w32_state *w32)
     RECT cr = r;
     add_window_borders(w32->window, &r);
 
-    if (!w32->opts->fullscreen &&
+    if (!w32->current_fs &&
         ((r.right - r.left) >= screen_w || (r.bottom - r.top) >= screen_h))
     {
         MP_VERBOSE(w32, "requested window size larger than the screen\n");
@@ -1039,34 +1100,16 @@ static int reinit_window_state(struct vo_w32_state *w32)
                (int)(r.bottom - r.top));
 
     SetWindowPos(w32->window, layer, r.left, r.top, r.right - r.left,
-                 r.bottom - r.top, SWP_FRAMECHANGED);
-    // For some reason, moving SWP_SHOWWINDOW to a second call works better
-    // with wine: returning from fullscreen doesn't cause a bogus resize to
-    // screen size.
-    // It's not needed on Windows XP or wine with a virtual desktop.
-    // It doesn't seem to have any negative effects.
-    SetWindowPos(w32->window, NULL, 0, 0, 0, 0,
-                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_SHOWWINDOW);
+                 r.bottom - r.top, SWP_FRAMECHANGED | SWP_SHOWWINDOW);
 
     signal_events(w32, VO_EVENT_RESIZE);
-
-    return 1;
 }
 
 static void gui_thread_reconfig(void *ptr)
 {
-    void **p = ptr;
-    struct vo_w32_state *w32 = p[0];
-    uint32_t flags = *(uint32_t *)p[1];
-    int *res = p[2];
+    struct vo_w32_state *w32 = ptr;
 
     struct vo *vo = w32->vo;
-
-    // we already have a fully initialized window, so nothing needs to be done
-    if (flags & VOFLAG_HIDDEN) {
-        *res = 1;
-        return;
-    }
 
     struct vo_win_geometry geo;
     vo_calc_window_geometry(vo, &w32->screenrc, &geo);
@@ -1107,17 +1150,28 @@ static void gui_thread_reconfig(void *ptr)
     w32->dw = vo->dwidth;
     w32->dh = vo->dheight;
 
-    *res = reinit_window_state(w32);
+    reinit_window_state(w32);
 }
 
-// Resize the window. On the first non-VOFLAG_HIDDEN call, it's also made visible.
-int vo_w32_config(struct vo *vo, uint32_t flags)
+// Resize the window. On the first call, it's also made visible.
+void vo_w32_config(struct vo *vo)
 {
     struct vo_w32_state *w32 = vo->w32;
-    int r;
-    void *p[] = {w32, &flags, &r};
-    mp_dispatch_run(w32->dispatch, gui_thread_reconfig, p);
-    return r;
+    mp_dispatch_run(w32->dispatch, gui_thread_reconfig, w32);
+}
+
+static void thread_disable_ime(void)
+{
+    // Disables the IME for windows on this thread. imm32.dll must be loaded
+    // dynamically to account for machines without East Asian language support.
+    HMODULE imm32 = LoadLibraryW(L"imm32.dll");
+    if (!imm32)
+        return;
+    BOOL (WINAPI *pImmDisableIME)(DWORD) = (BOOL (WINAPI*)(DWORD))
+        GetProcAddress(imm32, "ImmDisableIME");
+    if (pImmDisableIME)
+        pImmDisableIME(0);
+    FreeLibrary(imm32);
 }
 
 static void *gui_thread(void *ptr)
@@ -1127,6 +1181,8 @@ static void *gui_thread(void *ptr)
     int res = 0;
 
     mpthread_set_name("win32 window");
+
+    thread_disable_ime();
 
     HINSTANCE hInstance = GetModuleHandleW(NULL);
 
@@ -1139,11 +1195,7 @@ static void *gui_thread(void *ptr)
         .hCursor = LoadCursor(NULL, IDC_ARROW),
         .lpszClassName = classname,
     };
-
-    if (!RegisterClassExW(&wcex)) {
-        MP_ERR(w32, "unable to register window class!\n");
-        goto done;
-    }
+    RegisterClassExW(&wcex);
 
     w32_thread_context = w32;
 
@@ -1174,7 +1226,7 @@ static void *gui_thread(void *ptr)
     if (SUCCEEDED(OleInitialize(NULL))) {
         ole_ok = true;
 
-        fmtetc_url.cfFormat = (CLIPFORMAT)RegisterClipboardFormat(TEXT("UniformResourceLocator"));
+        fmtetc_url.cfFormat = (CLIPFORMAT)RegisterClipboardFormat(TEXT("UniformResourceLocatorW"));
         DropTarget* dropTarget = talloc(NULL, DropTarget);
         DropTarget_Init(dropTarget, w32);
         RegisterDragDrop(w32->window, &dropTarget->iface);
@@ -1188,6 +1240,20 @@ static void *gui_thread(void *ptr)
             if (FAILED(ITaskbarList2_HrInit(w32->taskbar_list))) {
                 ITaskbarList2_Release(w32->taskbar_list);
                 w32->taskbar_list = NULL;
+            }
+        }
+
+        // ITaskbarList3 has methods for status indication on taskbar buttons,
+        // however that interface is only available on Win7/2008 R2 or newer
+        if (SUCCEEDED(CoCreateInstance(&CLSID_TaskbarList, NULL,
+                                       CLSCTX_INPROC_SERVER, &IID_ITaskbarList3,
+                                       (void**)&w32->taskbar_list3)))
+        {
+            if (FAILED(ITaskbarList3_HrInit(w32->taskbar_list3))) {
+                ITaskbarList3_Release(w32->taskbar_list3);
+                w32->taskbar_list3 = NULL;
+            } else {
+                w32->tbtnCreatedMsg = RegisterWindowMessage(L"TaskbarButtonCreated");
             }
         }
     } else {
@@ -1206,7 +1272,7 @@ static void *gui_thread(void *ptr)
 
     w32->cursor_visible = true;
 
-    updateScreenProperties(w32);
+    update_screen_rect(w32);
 
     mp_dispatch_set_wakeup_fn(w32->dispatch, wakeup_gui_thread, w32);
 
@@ -1227,10 +1293,11 @@ done:
     }
     if (w32->taskbar_list)
         ITaskbarList2_Release(w32->taskbar_list);
+    if (w32->taskbar_list3)
+        ITaskbarList3_Release(w32->taskbar_list3);
     if (ole_ok)
         OleUninitialize();
     SetThreadExecutionState(ES_CONTINUOUS);
-    UnregisterClassW(classname, 0);
 
     w32_thread_context = NULL;
     return NULL;
@@ -1257,6 +1324,15 @@ int vo_w32_init(struct vo *vo)
     if (!mp_rendezvous(w32, 0)) { // init barrier
         pthread_join(w32->thread, NULL);
         goto fail;
+    }
+
+    // While the UI runs in its own thread, the thread in which this function
+    // runs in will be the renderer thread. Apply magic MMCSS cargo-cult,
+    // which might stop Windows from throttling clock rate and so on.
+    if (vo->opts->mmcss_profile[0]) {
+        wchar_t *profile = mp_from_utf8(NULL, vo->opts->mmcss_profile);
+        w32->avrt_handle = AvSetMmThreadCharacteristicsW(profile, &(DWORD){0});
+        talloc_free(profile);
     }
 
     return 1;
@@ -1336,10 +1412,39 @@ static int gui_thread_control(struct vo_w32_state *w32, int request, void *arg)
         talloc_free(title);
         return VO_TRUE;
     }
+    case VOCTRL_UPDATE_PLAYBACK_STATE: {
+        struct voctrl_playback_state *pstate =
+            (struct voctrl_playback_state *)arg;
+
+        if (!w32->taskbar_list3 || !w32->tbtnCreated)
+            return VO_TRUE;
+
+        if (!pstate->playing) {
+            ITaskbarList3_SetProgressState(w32->taskbar_list3, w32->window,
+                                           TBPF_NOPROGRESS);
+            return VO_TRUE;
+        }
+
+        ITaskbarList3_SetProgressValue(w32->taskbar_list3, w32->window,
+                                       pstate->percent_pos, 100);
+        ITaskbarList3_SetProgressState(w32->taskbar_list3, w32->window,
+                                       pstate->paused ? TBPF_PAUSED :
+                                                        TBPF_NORMAL);
+        return VO_TRUE;
+    }
     case VOCTRL_GET_DISPLAY_FPS:
-        update_display_fps(w32);
+        update_display_info(w32);
         *(double*) arg = w32->display_fps;
         return VO_TRUE;
+    case VOCTRL_GET_ICC_PROFILE:
+        update_display_info(w32);
+        if (w32->color_profile) {
+            bstr *p = arg;
+            *p = stream_read_file(w32->color_profile, NULL,
+                w32->vo->global, 100000000); // 100 MB
+            return p->len ? VO_TRUE : VO_FALSE;
+        }
+        return VO_FALSE;
     }
     return VO_NOTIMPL;
 }
@@ -1388,6 +1493,8 @@ void vo_w32_uninit(struct vo *vo)
 
     mp_dispatch_run(w32->dispatch, do_terminate, w32);
     pthread_join(w32->thread, NULL);
+
+    AvRevertMmThreadCharacteristics(w32->avrt_handle);
 
     talloc_free(w32);
     vo->w32 = NULL;

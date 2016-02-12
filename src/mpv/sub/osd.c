@@ -28,10 +28,12 @@
 
 #include "osdep/timer.h"
 
-#include "talloc.h"
+#include "mpv_talloc.h"
 #include "options/options.h"
 #include "common/global.h"
 #include "common/msg.h"
+#include "player/client.h"
+#include "player/command.h"
 #include "osd.h"
 #include "osd_state.h"
 #include "dec_sub.h"
@@ -163,10 +165,10 @@ void osd_set_text(struct osd_state *osd, int obj, const char *text)
     pthread_mutex_unlock(&osd->lock);
 }
 
-void osd_set_sub(struct osd_state *osd, int obj, struct osd_sub_state *substate)
+void osd_set_sub(struct osd_state *osd, int obj, struct dec_sub *dec_sub)
 {
     pthread_mutex_lock(&osd->lock);
-    osd->objs[obj]->sub_state = substate ? *substate : (struct osd_sub_state){0};
+    osd->objs[obj]->sub = dec_sub;
     pthread_mutex_unlock(&osd->lock);
 }
 
@@ -188,7 +190,7 @@ void osd_set_render_subs_in_filter(struct osd_state *osd, bool s)
 void osd_set_progbar(struct osd_state *osd, struct osd_progbar_state *s)
 {
     pthread_mutex_lock(&osd->lock);
-    struct osd_object *osd_obj = osd->objs[OSDTYPE_PROGBAR];
+    struct osd_object *osd_obj = osd->objs[OSDTYPE_OSD];
     osd_obj->progbar_state.type = s->type;
     osd_obj->progbar_state.value = s->value;
     osd_obj->progbar_state.num_stops = s->num_stops;
@@ -224,14 +226,6 @@ void osd_set_external2(struct osd_state *osd, struct sub_bitmaps *imgs)
     pthread_mutex_unlock(&osd->lock);
 }
 
-void osd_set_nav_highlight(struct osd_state *osd, void *priv)
-{
-    pthread_mutex_lock(&osd->lock);
-    osd->objs[OSDTYPE_NAV_HIGHLIGHT]->highlight_priv = priv;
-    osd_changed_unlocked(osd, OSDTYPE_NAV_HIGHLIGHT);
-    pthread_mutex_unlock(&osd->lock);
-}
-
 static void render_object(struct osd_state *osd, struct osd_object *obj,
                           struct mp_osd_res res, double video_pts,
                           const bool sub_formats[SUBBITMAP_COUNT],
@@ -246,28 +240,25 @@ static void render_object(struct osd_state *osd, struct osd_object *obj,
 
     *out_imgs = (struct sub_bitmaps) {0};
 
-    if (!osd_res_equals(res, obj->vo_res))
+    if (!osd_res_equals(res, obj->vo_res)) {
+        obj->vo_res = res;
         obj->force_redraw = true;
-    obj->vo_res = res;
+        mp_client_broadcast_event(mp_client_api_get_core(osd->global->client_api),
+                                  MP_EVENT_WIN_RESIZE, NULL);
+    }
 
     if (obj->type == OSDTYPE_SUB || obj->type == OSDTYPE_SUB2) {
-        struct osd_sub_state *sub = &obj->sub_state;
-        if (sub->render_bitmap_subs && sub->dec_sub) {
+        if (obj->sub) {
             double sub_pts = video_pts;
             if (sub_pts != MP_NOPTS_VALUE)
-                sub_pts -= sub->video_offset + opts->sub_delay;
-            sub_get_bitmaps(sub->dec_sub, obj->vo_res, sub_pts, out_imgs);
-        } else {
-            osd_object_get_bitmaps(osd, obj, out_imgs);
+                sub_pts -= opts->sub_delay;
+            sub_get_bitmaps(obj->sub, obj->vo_res, sub_pts, out_imgs);
         }
     } else if (obj->type == OSDTYPE_EXTERNAL2) {
         if (obj->external2 && obj->external2->format) {
             *out_imgs = *obj->external2;
             obj->external2->change_id = 0;
         }
-    } else if (obj->type == OSDTYPE_NAV_HIGHLIGHT) {
-        if (obj->highlight_priv)
-            mp_nav_get_highlight(obj->highlight_priv, obj->vo_res, out_imgs);
     } else {
         osd_object_get_bitmaps(osd, obj, out_imgs);
     }
@@ -335,8 +326,8 @@ void osd_draw(struct osd_state *osd, struct mp_osd_res res,
         if ((draw_flags & OSD_DRAW_OSD_ONLY) && obj->is_sub)
             continue;
 
-        if (obj->sub_state.dec_sub)
-            sub_lock(obj->sub_state.dec_sub);
+        if (obj->sub)
+            sub_lock(obj->sub);
 
         struct sub_bitmaps imgs;
         render_object(osd, obj, res, video_pts, formats, &imgs);
@@ -349,8 +340,8 @@ void osd_draw(struct osd_state *osd, struct mp_osd_res res,
             }
         }
 
-        if (obj->sub_state.dec_sub)
-            sub_unlock(obj->sub_state.dec_sub);
+        if (obj->sub)
+            sub_unlock(obj->sub);
     }
 
     pthread_mutex_unlock(&osd->lock);
@@ -402,13 +393,10 @@ void osd_draw_on_image_p(struct osd_state *osd, struct mp_osd_res res,
 // ratio if the image does not have a 1:1 pixel aspect ratio.
 struct mp_osd_res osd_res_from_image_params(const struct mp_image_params *p)
 {
-    double sar = (double)p->w / p->h;
-    double dar = (double)p->d_w / p->d_h;
-
     return (struct mp_osd_res) {
         .w = p->w,
         .h = p->h,
-        .display_par = sar / dar,
+        .display_par = p->p_h / (double)p->p_w,
     };
 }
 
@@ -491,13 +479,8 @@ void osd_rescale_bitmaps(struct sub_bitmaps *imgs, int frame_w, int frame_h,
     double yscale = (double)vidh / frame_h;
     if (compensate_par < 0)
         compensate_par = xscale / yscale / res.display_par;
-    if (compensate_par > 0) {
-        if (compensate_par > 1.0) {
-            xscale /= compensate_par;
-        } else {
-            yscale *= compensate_par;
-        }
-    }
+    if (compensate_par > 0)
+        xscale /= compensate_par;
     int cx = vidw / 2 - (int)(frame_w * xscale) / 2;
     int cy = vidh / 2 - (int)(frame_h * yscale) / 2;
     for (int i = 0; i < imgs->num_parts; i++) {

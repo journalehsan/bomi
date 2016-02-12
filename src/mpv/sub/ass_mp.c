@@ -40,11 +40,13 @@
 void mp_ass_set_style(ASS_Style *style, double res_y,
                       const struct osd_style_opts *opts)
 {
+    if (!style)
+        return;
+
     if (opts->font) {
         if (!style->FontName || strcmp(style->FontName, opts->font) != 0) {
             free(style->FontName);
             style->FontName = strdup(opts->font);
-            style->treat_fontname_as_pattern = 1;
         }
     }
 
@@ -74,42 +76,6 @@ void mp_ass_set_style(ASS_Style *style, double res_y,
     style->Alignment = 1 + (opts->align_x + 1) + (opts->align_y + 2) % 3 * 4;
     style->Blur = opts->blur;
     style->Bold = opts->bold;
-}
-
-// Add default styles, if the track does not have any styles yet.
-// Apply style overrides if the user provides any.
-void mp_ass_add_default_styles(ASS_Track *track, struct MPOpts *opts)
-{
-    if (opts->ass_styles_file && opts->ass_style_override)
-        ass_read_styles(track, opts->ass_styles_file, NULL);
-
-    if (track->n_styles == 0) {
-        if (!track->PlayResY) {
-            track->PlayResY = MP_ASS_FONT_PLAYRESY;
-            track->PlayResX = track->PlayResY * 4 / 3;
-        }
-        track->Kerning = true;
-        int sid = ass_alloc_style(track);
-        track->default_style = sid;
-        ASS_Style *style = track->styles + sid;
-        style->Name = strdup("Default");
-        mp_ass_set_style(style, track->PlayResY, opts->sub_text_style);
-    }
-
-    if (opts->ass_style_override)
-        ass_process_force_style(track);
-}
-
-ASS_Track *mp_ass_default_track(ASS_Library *library, struct MPOpts *opts)
-{
-    ASS_Track *track = ass_new_track(library);
-
-    track->track_type = TRACK_TYPE_ASS;
-    track->Timer = 100.;
-
-    mp_ass_add_default_styles(track, opts);
-
-    return track;
 }
 
 void mp_ass_configure_fonts(ASS_Renderer *priv, struct osd_style_opts *opts,
@@ -196,4 +162,18 @@ ASS_Library *mp_ass_init(struct mpv_global *global, struct mp_log *log)
     ass_set_extract_fonts(priv, global->opts->use_embedded_fonts);
     talloc_free(path);
     return priv;
+}
+
+void mp_ass_flush_old_events(ASS_Track *track, long long ts)
+{
+    int n = 0;
+    for (; n < track->n_events; n++) {
+        if ((track->events[n].Start + track->events[n].Duration) >= ts)
+            break;
+        ass_free_event(track, n);
+        track->n_events--;
+    }
+    for (int i = 0; n > 0 && i < track->n_events; i++) {
+        track->events[i] = track->events[i+n];
+    }
 }

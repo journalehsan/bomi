@@ -20,10 +20,8 @@ normal driver parameters.
 
     See ``--ao=help`` for a list of compiled-in audio output drivers. The
     driver ``--ao=alsa`` is preferred. ``--ao=pulse`` is preferred on systems
-    where PulseAudio is used. On Windows, ``--ao=wasapi`` is preferred,
-    though it might cause trouble sometimes, in which case ``--ao=dsound``
-    should be used. On BSD systems, ``--ao=oss`` or `--ao=sndio`` may work
-    (the latter being experimental). On OS X systems, use ``--ao=coreaudio``.
+    where PulseAudio is used. On BSD systems, ``--ao=oss`` or ``--ao=sndio``
+    may work (the latter being experimental).
 
 .. admonition:: Examples
 
@@ -55,7 +53,7 @@ Available audio output drivers are:
         Allow output of non-interleaved formats (if the audio decoder uses
         this format). Currently disabled by default, because some popular
         ALSA plugins are utterly broken with non-interleaved formats.
-    ``ingore-chmap``
+    ``ignore-chmap``
         Don't read or set the channel map of the ALSA device - only request the
         required number of channels, and then pass the audio as-is to it. This
         option most likely should not be used. It can be useful for debugging,
@@ -139,16 +137,13 @@ Available audio output drivers are:
         Automatically create connections to output ports (default: enabled).
         When enabled, the maximum number of output channels will be limited to
         the number of available output ports.
-    ``std-channel-layout=alsa|waveext|any``
-        Select the standard channel layout (default: alsa). JACK itself has no
+    ``std-channel-layout=waveext|any``
+        Select the standard channel layout (default: waveext). JACK itself has no
         notion of channel layouts (i.e. assigning which speaker a given
         channel is supposed to map to) - it just takes whatever the application
         outputs, and reroutes it to whatever the user defines. This means the
         user and the application are in charge of dealing with the channel
-        layout. ``alsa`` uses the old MPlayer layout, which is inspired by
-        ALSA's standard layouts. In this mode, ao_jack will refuse to play 3
-        or 7 channels (because these do not really have a defined meaning in
-        MPlayer). ``waveext`` uses WAVE_FORMAT_EXTENSIBLE order, which, even
+        layout. ``waveext`` uses WAVE_FORMAT_EXTENSIBLE order, which, even
         though it was defined by Microsoft, is the standard on many systems.
         The value ``any`` makes JACK accept whatever comes from the audio
         filter chain, regardless of channel layout and without reordering. This
@@ -168,13 +163,16 @@ Available audio output drivers are:
         will actually work. The disadvantage is that it will change the
         system-wide audio settings. This is equivalent to changing the ``Format``
         setting in the ``Audio Devices`` dialog in the ``Audio MIDI Setup``
-        utility. Note that this does not effect the selected speaker setup.
+        utility. Note that this does not affect the selected speaker setup.
+
+    ``exclusive``
+        Use exclusive mode access. This merely redirects to
+        ``coreaudio_exclusive``, but should be preferred over using that AO
+        directly.
 
 ``coreaudio_exclusive`` (Mac OS X only)
     Native Mac OS X audio output driver using direct device access and
     exclusive mode (bypasses the sound server).
-
-    Supports only compressed formats (AC3 and DTS).
 
 ``openal``
     Experimental OpenAL audio output driver
@@ -205,19 +203,7 @@ Available audio output drivers are:
         (it used to be required to get good behavior on old PulseAudio versions).
 
         If you have stuttering video when using pulse, try to enable this
-        option. (Or alternatively, try to update PulseAudio.)
-
-``dsound`` (Windows only)
-    DirectX DirectSound audio output driver
-
-    .. note:: This driver is for compatibility with old systems.
-
-    ``device=<devicenum>``
-        Sets the device number to use. Playing a file with ``-v`` will show a
-        list of available devices.
-
-    ``buffersize=<ms>``
-        DirectSound buffer size in milliseconds (default: 200).
+        option. (Or try to update PulseAudio.)
 
 ``sdl``
     SDL 1.2+ audio output driver. Should work on any platform supported by SDL
@@ -256,7 +242,7 @@ Available audio output drivers are:
     ``speed``
         Simulated audio playback speed as a multiplier. Usually, a real audio
         device will not go exactly as fast as the system clock. It will deviate
-        just a little, and this option helps simulating this.
+        just a little, and this option helps to simulate this.
 
     ``latency``
         Simulated device latency. This is additional to EOF.
@@ -325,7 +311,7 @@ Available audio output drivers are:
         String are valid; the GUID string is guaranteed to not change
         unless the driver is uninstalled.
 
-        Also supports searching active devices by human readable name. If more
+        Also supports searching active devices by human-readable name. If more
         than one device matches the name, refuses loading it.
 
         This option is mostly deprecated in favour of the more general

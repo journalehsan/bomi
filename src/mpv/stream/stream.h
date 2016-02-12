@@ -72,6 +72,7 @@ enum stream_ctrl {
     STREAM_CTRL_GET_CACHE_FILL,
     STREAM_CTRL_GET_CACHE_IDLE,
     STREAM_CTRL_RESUME_CACHE,
+    STREAM_CTRL_SET_READAHEAD,
 
     // stream_memory.c
     STREAM_CTRL_SET_CONTENTS,
@@ -98,13 +99,13 @@ enum stream_ctrl {
     STREAM_CTRL_TV_STEP_CHAN,
     STREAM_CTRL_TV_LAST_CHAN,
     STREAM_CTRL_DVB_SET_CHANNEL,
+    STREAM_CTRL_DVB_SET_CHANNEL_NAME,
+    STREAM_CTRL_DVB_GET_CHANNEL_NAME,
     STREAM_CTRL_DVB_STEP_CHANNEL,
 
     // Optical discs
     STREAM_CTRL_GET_TIME_LENGTH,
     STREAM_CTRL_GET_DVD_INFO,
-    STREAM_CTRL_GET_NAV_EVENT,          // struct mp_nav_event**
-    STREAM_CTRL_NAV_CMD,                // struct mp_nav_cmd*
     STREAM_CTRL_GET_DISC_NAME,
     STREAM_CTRL_GET_NUM_CHAPTERS,
     STREAM_CTRL_GET_CURRENT_TIME,
@@ -253,6 +254,7 @@ int stream_read(stream_t *s, char *mem, int total);
 int stream_read_partial(stream_t *s, char *buf, int buf_size);
 struct bstr stream_peek(stream_t *s, int len);
 void stream_drop_buffers(stream_t *s);
+int64_t stream_get_size(stream_t *s);
 
 struct mpv_global;
 

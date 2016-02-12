@@ -28,7 +28,7 @@
 #include "misc/bstr.h"
 #include "osdep/io.h"
 #include "options/path.h"
-#include "talloc.h"
+#include "mpv_talloc.h"
 #include "common/common.h"
 #include "common/msg.h"
 #include "video/out/vo.h"
@@ -64,7 +64,7 @@ static bool checked_mkdir(struct vo *vo, const char *buf)
     return true;
 }
 
-static int reconfig(struct vo *vo, struct mp_image_params *params, int flags)
+static int reconfig(struct vo *vo, struct mp_image_params *params)
 {
     struct priv *p = vo->priv;
     mp_image_unrefp(&p->current);
